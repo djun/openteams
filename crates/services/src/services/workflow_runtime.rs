@@ -38,10 +38,10 @@ use ts_rs::TS;
 use utils::{log_msg::LogMsg, msg_store::MsgStore, utf8::Utf8LossyDecoder};
 use uuid::Uuid;
 
-const WORKFLOW_EXECUTION_TIMEOUT: Duration = Duration::from_secs(2400);
-const WORKFLOW_DRAIN_TIMEOUT: Duration = Duration::from_millis(3500);
-const WORKFLOW_REAP_TIMEOUT: Duration = Duration::from_secs(30);
-const WORKFLOW_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+const WORKFLOW_EXECUTION_TIMEOUT: Duration = Duration::from_secs(3600);
+const WORKFLOW_DRAIN_TIMEOUT: Duration = Duration::from_millis(35);
+const WORKFLOW_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+const WORKFLOW_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const EXECUTOR_PROFILE_VARIANT_KEY: &str = "executor_profile_variant";
 
 #[derive(Debug, thiserror::Error)]

@@ -286,7 +286,7 @@ pub fn validate_agent_session_in_execution(
     match execution_status {
         E::Running => matches!(
             session_state,
-            A::Idle | A::Running | A::WaitingInput | A::Completed | A::Failed
+            A::Idle | A::Running | A::WaitingInput | A::WaitingApproval | A::Completed | A::Failed
         ),
         E::Interrupting => matches!(
             session_state,
