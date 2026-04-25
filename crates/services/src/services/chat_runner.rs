@@ -77,25 +77,6 @@ const RUN_RECORDS_DIR_NAME: &str = "run_records";
 const SHARED_PROTOCOL_DIR_NAME: &str = "protocol";
 const SHARED_BLACKBOARD_FILE_NAME: &str = "shared_blackboard.jsonl";
 const WORK_RECORDS_FILE_NAME: &str = "work_records.jsonl";
-const MARKDOWN_PROTOCOL_RECORD_RULE: &str = "Write only long-lived shared facts to shared_blackboard.jsonl. Do not write process descriptions, temporary status, or blockers.";
-const MARKDOWN_PROTOCOL_ARTIFACT_RULE: &str =
-    "Write only deliverable outputs or their concrete paths to work_records.jsonl.";
-const MARKDOWN_PROTOCOL_CONCLUSION_RULE: &str = "Write only the current-turn work status to work_records.jsonl. Include completed work, blockers, or next steps. Do not write long-lived facts.";
-const HISTORY_GROUP_MESSAGES_INSTRUCTION: &str = concat!(
-    "If you need to understand the current group chat state, you MAY inspect this file yourself.\n",
-    "Reading history is optional. Do not assume you must read history before acting.\n",
-    "Prioritize reading history when the new message implies continuation or refinement, such as \"continue\", \"继续\", \"接着\", \"基于前文\", \"refine\", or \"update\".\n",
-    "If the current task can be completed independently, you do not need to read history.\n",
-);
-const HISTORY_SHARED_BLACKBOARD_INSTRUCTION: &str = concat!(
-    "You can search by member name to find shared messages published by a specific member.\n",
-    "Before writing a record item, if you are unsure whether the fact was already captured, check this file first.\n",
-);
-const HISTORY_WORK_RECORDS_INSTRUCTION: &str = concat!(
-    "You can search by member name to find a specific member's work outputs and status summaries.\n",
-    "Use this file when you need to review what members have already completed.\n",
-    "Before writing an artifact or conclusion item, if you are unsure whether similar work or status was already recorded, check this file first.\n",
-);
 const RESERVED_USER_HANDLE: &str = "you";
 const PROTOCOL_SEND_INTENT_VALUES: &[&str] = &["request", "reply", "notify", "blocker", "confirm"];
 const EXECUTOR_PROFILE_VARIANT_KEY: &str = "executor_profile_variant";
@@ -163,7 +144,7 @@ const PROTOCOL_OUTPUT_SCHEMA_JSON: &str = r#"{
           "type": { "const": "workflow_generate" },
           "content": { "type": "string" }
         },
-        "required": ["type"],
+        "required": ["type", "content"],
         "additionalProperties": false
       }
     ]
@@ -586,6 +567,19 @@ pub enum ChatStreamEvent {
         edges: Vec<WorkflowPlanEdge>,
         changed_step_ids: Vec<String>,
     },
+    WorkflowRuntimeLine {
+        line_id: Uuid,
+        session_id: Uuid,
+        execution_id: Uuid,
+        workflow_agent_session_id: Option<Uuid>,
+        step_id: Uuid,
+        step_key: String,
+        agent_id: Uuid,
+        agent_name: String,
+        stream_type: ChatStreamDeltaType,
+        content: String,
+        created_at: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -837,6 +831,38 @@ impl ChatRunner {
                 nodes,
                 edges,
                 changed_step_ids,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_workflow_runtime_line(
+        &self,
+        session_id: Uuid,
+        execution_id: Uuid,
+        workflow_agent_session_id: Option<Uuid>,
+        step_id: Uuid,
+        step_key: String,
+        agent_id: Uuid,
+        agent_name: String,
+        stream_type: ChatStreamDeltaType,
+        content: String,
+        created_at: String,
+    ) {
+        self.emit(
+            session_id,
+            ChatStreamEvent::WorkflowRuntimeLine {
+                line_id: Uuid::new_v4(),
+                session_id,
+                execution_id,
+                workflow_agent_session_id,
+                step_id,
+                step_key,
+                agent_id,
+                agent_name,
+                stream_type,
+                content,
+                created_at,
             },
         );
     }

@@ -41,8 +41,8 @@ use super::{
     workflow_runtime::{
         SummaryPayload, WorkflowRuntimeError, WorkflowStepProtocolMessage, WorkflowStepRunResult,
         build_step_execution_prompt, build_workflow_card_projection, cancel_running_step,
-        parse_summary_payload, predecessor_summaries, run_workflow_agent_follow_up,
-        run_workflow_agent_prompt,
+        parse_summary_payload, predecessor_summaries, run_workflow_step_agent_follow_up,
+        run_workflow_step_agent_prompt,
     },
 };
 
@@ -1428,14 +1428,15 @@ impl WorkflowOrchestrator {
             let follow_up_prompt =
                 Self::build_step_follow_up_prompt(&running_step, &transcript.content, input_text);
 
-            let protocol_message = match run_workflow_agent_follow_up(
+            let protocol_message = match run_workflow_step_agent_follow_up(
                 db,
+                chat_runner,
                 &session,
                 agent,
                 session_agent,
                 workflow_session,
                 &follow_up_prompt,
-                running_step.id,
+                &running_step,
             )
             .await
             {
@@ -1459,6 +1460,7 @@ impl WorkflowOrchestrator {
                                     })
                                     .unwrap_or_else(|_| err.to_string()),
                                 ),
+                                None,
                             )
                             .await?;
                             Self::transition_step_and_sync(
@@ -1540,6 +1542,7 @@ impl WorkflowOrchestrator {
                             })
                             .unwrap_or_else(|_| err.to_string()),
                         ),
+                        None,
                     )
                     .await?;
                     Self::transition_step_and_sync(
@@ -2084,6 +2087,7 @@ impl WorkflowOrchestrator {
                         })
                         .unwrap_or_else(|_| failure_reason.clone()),
                     ),
+                    None,
                 )
                 .await?;
                 let failed_step = Self::transition_step_and_sync(
@@ -2356,6 +2360,10 @@ impl WorkflowOrchestrator {
                 })
             })
             .collect();
+        let agent_name_by_id: HashMap<String, String> = agent_views
+            .iter()
+            .map(|agent| (agent.agent_id.clone(), agent.name.clone()))
+            .collect();
 
         let step_views: Vec<super::workflow_runtime::WorkflowCardStep> = parsed_plan
             .nodes
@@ -2372,8 +2380,14 @@ impl WorkflowOrchestrator {
                     title: n.data.title.clone(),
                     step_type: step_type_str,
                     status: "pending".to_string(),
-                    agent_name: n.data.agent_id.clone(),
+                    agent_name: n
+                        .data
+                        .agent_id
+                        .as_ref()
+                        .and_then(|agent_id| agent_name_by_id.get(agent_id).cloned())
+                        .or_else(|| n.data.agent_id.clone()),
                     summary_text: None,
+                    content: None,
                 }
             })
             .collect();
@@ -2486,7 +2500,20 @@ impl WorkflowOrchestrator {
         let active_executions =
             WorkflowExecution::find_non_terminal_by_session(pool, plan.session_id).await?;
         for existing in &active_executions {
+            tracing::debug!(
+                "checking existing execution {} with plan_id {:?} new plan_id {}",
+                existing.id,
+                existing.plan_id,
+                plan_id
+            );
+
             if existing.plan_id == plan_id {
+                tracing::info!(
+                    "found existing active execution {} for plan {}, returning existing execution",
+                    existing.id,
+                    plan_id
+                );
+
                 // Already executing this plan
                 let steps = WorkflowStep::find_by_execution(pool, existing.id).await?;
                 let edges = WorkflowStepEdge::find_by_execution(pool, existing.id).await?;
@@ -2858,7 +2885,13 @@ Rules:
             WorkflowStepProtocolMessage::Error {
                 message, content, ..
             } => {
-                let err = Self::step_message_error(message, content);
+                let error_message = message.trim().to_string();
+                let error_detail = content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let err = Self::step_message_error(error_message.clone(), error_detail.clone());
                 let failed_step = WorkflowStep::record_execution_result(
                     pool,
                     running_step.id,
@@ -2871,8 +2904,26 @@ Rules:
                         })
                         .unwrap_or_else(|_| err.to_string()),
                     ),
+                    None,
                 )
                 .await?;
+                let error_meta = serde_json::json!({
+                    "description": error_detail,
+                    "source": "workflow_protocol_error",
+                })
+                .to_string();
+                let _ = Self::write_transcript(
+                    pool,
+                    execution.id,
+                    failed_step.round_id.into(),
+                    Some(workflow_session.id),
+                    Some(failed_step.id),
+                    "control",
+                    "error",
+                    &error_message,
+                    Some(&error_meta),
+                )
+                .await;
                 Self::transition_step_and_sync(
                     pool,
                     chat_runner,
@@ -2882,18 +2933,6 @@ Rules:
                     "step_failed",
                 )
                 .await?;
-                let _ = Self::write_transcript(
-                    pool,
-                    execution.id,
-                    failed_step.round_id.into(),
-                    Some(workflow_session.id),
-                    Some(failed_step.id),
-                    "system",
-                    "message",
-                    &format!("Step \"{}\" failed: {}", failed_step.title, err),
-                    None,
-                )
-                .await;
                 Ok(StepOutcome::Failed(err.to_string()))
             }
             WorkflowStepProtocolMessage::FinalResult {
@@ -2920,15 +2959,7 @@ Rules:
                         })
                         .unwrap_or_else(|_| execution_result.summary.clone()),
                     ),
-                )
-                .await?;
-                Self::transition_step_and_sync(
-                    pool,
-                    chat_runner,
-                    execution,
-                    &recorded_step,
-                    WorkflowStepStatus::Completed,
-                    "step_completed",
+                    Some(execution_result.content.clone()),
                 )
                 .await?;
                 let _ = Self::write_transcript(
@@ -2939,17 +2970,26 @@ Rules:
                     Some(recorded_step.id),
                     "agent",
                     "message",
-                    &execution_result.summary,
+                    &execution_result.content,
                     Some(
-                        &serde_json::to_string(&SummaryPayload {
-                            summary: execution_result.summary.clone(),
-                            content: Some(execution_result.content.clone()),
-                            outputs: execution_result.outputs.clone(),
+                        &serde_json::json!({
+                            "summary": execution_result.summary.clone(),
+                            "outputs": execution_result.outputs.clone(),
+                            "source": "workflow_protocol_final_result",
                         })
-                        .unwrap_or_default(),
+                        .to_string(),
                     ),
                 )
                 .await;
+                Self::transition_step_and_sync(
+                    pool,
+                    chat_runner,
+                    execution,
+                    &recorded_step,
+                    WorkflowStepStatus::Completed,
+                    "step_completed",
+                )
+                .await?;
                 Ok(StepOutcome::Completed)
             }
         }
@@ -3047,14 +3087,15 @@ Rules:
             prompt
         );
 
-        let protocol_message = match run_workflow_agent_prompt(
+        let protocol_message = match run_workflow_step_agent_prompt(
             db,
+            chat_runner,
             session,
             agent,
             session_agent,
             Some(workflow_session),
             &prompt,
-            running_step.id,
+            &running_step,
         )
         .await
         {
@@ -3079,6 +3120,7 @@ Rules:
                                 })
                                 .unwrap_or_else(|_| err.to_string()),
                             ),
+                            None,
                         )
                         .await?;
                         Self::transition_step_and_sync(
@@ -3124,18 +3166,20 @@ Rules:
                 return Ok(StepOutcome::Failed(reason));
             }
             Err(err) => {
+                let err_message = err.to_string();
                 let failed_step = WorkflowStep::record_execution_result(
                     pool,
                     running_step.id,
                     Uuid::new_v4(),
                     Some(
                         serde_json::to_string(&SummaryPayload {
-                            summary: err.to_string(),
+                            summary: err_message.clone(),
                             content: None,
                             outputs: vec![],
                         })
-                        .unwrap_or_else(|_| err.to_string()),
+                        .unwrap_or_else(|_| err_message.clone()),
                     ),
+                    None,
                 )
                 .await?;
                 Self::transition_step_and_sync(
@@ -3159,7 +3203,7 @@ Rules:
                     None,
                 )
                 .await;
-                return Ok(StepOutcome::Failed(err.to_string()));
+                return Ok(StepOutcome::Failed(err_message));
             }
         };
 

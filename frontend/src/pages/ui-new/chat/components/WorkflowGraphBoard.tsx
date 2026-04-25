@@ -1,9 +1,4 @@
 import { useMemo, useState } from 'react';
-import {
-  ArrowClockwiseIcon,
-  RobotIcon,
-  SparkleIcon,
-} from '@phosphor-icons/react';
 import { cn } from '@/lib/utils';
 
 type WorkflowGraphStep = {
@@ -14,6 +9,7 @@ type WorkflowGraphStep = {
   status: string;
   agent_name?: string | null;
   summary_text?: string | null;
+  content?: string | null;
 };
 
 type WorkflowGraphNode = {
@@ -28,6 +24,13 @@ type WorkflowGraphNode = {
   };
 };
 
+type WorkflowGraphAgent = {
+  session_agent_id: string;
+  workflow_agent_session_id?: string | null;
+  agent_id: string;
+  name: string;
+};
+
 type WorkflowGraphEdge = {
   id: string;
   source: string;
@@ -38,9 +41,9 @@ type WorkflowGraphBoardProps = {
   nodes: WorkflowGraphNode[];
   edges: WorkflowGraphEdge[];
   steps: WorkflowGraphStep[];
+  agents?: WorkflowGraphAgent[];
   selectedStepId?: string | null;
   onSelectStep?: (id: string) => void;
-  onRetryStep?: (stepId: string) => void;
   compact?: boolean;
   className?: string;
 };
@@ -126,12 +129,12 @@ function layoutGraph(
     return null;
   }
 
-  const cardWidth = compact ? 212 : 232;
-  const cardHeight = compact ? 138 : 156;
-  const horizontalGap = compact ? 56 : 72;
-  const verticalGap = compact ? 24 : 30;
-  const paddingX = compact ? 28 : 40;
-  const paddingY = compact ? 28 : 40;
+  const cardWidth = compact ? 184 : 208;
+  const cardHeight = compact ? 104 : 118;
+  const horizontalGap = compact ? 44 : 60;
+  const verticalGap = compact ? 18 : 24;
+  const paddingX = compact ? 24 : 36;
+  const paddingY = compact ? 24 : 36;
   const verticalScale = 2;
 
   const sortedNodes = [...nodes].sort(
@@ -343,9 +346,9 @@ export function WorkflowGraphBoard({
   nodes,
   edges,
   steps,
+  agents = [],
   selectedStepId = null,
   onSelectStep,
-  onRetryStep,
   compact = false,
   className,
 }: WorkflowGraphBoardProps) {
@@ -363,6 +366,28 @@ export function WorkflowGraphBoard({
     () => new Map(layout.nodes.map((node) => [node.id, node])),
     [layout.nodes]
   );
+  const agentNameByLookup = useMemo(() => {
+    const lookup = new Map<string, string>();
+
+    for (const agent of agents) {
+      const keys = [
+        agent.name,
+        agent.agent_id,
+        agent.session_agent_id,
+        agent.workflow_agent_session_id,
+      ];
+
+      for (const key of keys) {
+        const normalizedKey = key?.trim();
+        if (!normalizedKey || lookup.has(normalizedKey)) {
+          continue;
+        }
+        lookup.set(normalizedKey, agent.name);
+      }
+    }
+
+    return lookup;
+  }, [agents]);
   const emphasizedNodeId = hoveredNodeId ?? selectedStepId ?? null;
   const renderedEdges = useMemo<RenderEdge[]>(() => {
     const groupedEdges = new Map<
@@ -477,9 +502,15 @@ export function WorkflowGraphBoard({
             step?.status ?? node.data.status,
             node.id === selectedStepId
           );
-          const summary = step?.summary_text?.trim() || 'Summary pending';
-          const agentName = step?.agent_name?.trim() || 'Lead';
-          const showRetry = step?.status === 'failed' && !!onRetryStep;
+          const stepAgentLabel = step?.agent_name?.trim();
+          const agentName =
+            (stepAgentLabel
+              ? agentNameByLookup.get(stepAgentLabel) ?? stepAgentLabel
+              : null) ??
+            (node.data.agentId
+              ? agentNameByLookup.get(node.data.agentId.trim()) ?? null
+              : null) ??
+            'Lead';
 
           return (
             <div
@@ -506,9 +537,7 @@ export function WorkflowGraphBoard({
               }
               className={cn(
                 'absolute flex flex-col rounded-[26px] border bg-white/92 text-left transition-all duration-200 hover:-translate-y-0.5 hover:bg-white dark:bg-[rgba(15,23,42,0.92)] dark:hover:bg-[rgba(15,23,42,0.98)]',
-                compact
-                  ? 'h-[138px] w-[212px] p-3.5'
-                  : 'h-[156px] w-[232px] p-4',
+                compact ? 'h-[104px] w-[184px] p-3' : 'h-[118px] w-[208px] p-3.5',
                 onSelectStep && 'cursor-pointer',
                 tone.glow,
                 (node.id === selectedStepId || node.id === hoveredNodeId) &&
@@ -521,12 +550,9 @@ export function WorkflowGraphBoard({
                 boxShadow: `inset 0 1px 0 rgba(255,255,255,0.7), 0 0 0 1px ${tone.accent}`,
               }}
             >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-[#94A3B8]">
-                    {step?.step_type ?? node.data.stepType}
-                  </div>
-                  <div className="mt-1 line-clamp-2 text-sm font-semibold leading-5 text-[#0F172A] dark:text-white">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="line-clamp-2 text-sm font-semibold leading-5 text-[#0F172A] dark:text-white">
                     {step?.title ?? node.data.title}
                   </div>
                 </div>
@@ -540,47 +566,15 @@ export function WorkflowGraphBoard({
                 </span>
               </div>
 
-              <div
-                className={cn(
-                  'mt-3 text-xs leading-5 text-[#475569] dark:text-[#CBD5E1]',
-                  compact ? 'line-clamp-3' : 'line-clamp-4'
-                )}
-              >
-                {summary}
-              </div>
-
-              <div className="mt-auto flex items-end justify-between gap-3">
+              <div className="mt-auto min-w-0">
+                <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#94A3B8]">
+                  Agent
+                </div>
                 <div className="min-w-0">
-                  <div className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-[0.16em] text-[#94A3B8]">
-                    <RobotIcon className="size-3" weight="fill" />
-                    Agent
-                  </div>
-                  <div className="truncate text-xs font-semibold text-[#0F172A] dark:text-white">
+                  <div className="mt-1 truncate text-xs font-semibold text-[#0F172A] dark:text-white">
                     {agentName}
                   </div>
                 </div>
-
-                {showRetry ? (
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      if (!step) {
-                        return;
-                      }
-                      onRetryStep(step.id);
-                    }}
-                    className="inline-flex items-center gap-1 rounded-full bg-[#991B1B] px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:bg-[#7F1D1D]"
-                  >
-                    <ArrowClockwiseIcon className="size-3" weight="bold" />
-                    Retry
-                  </button>
-                ) : (
-                  <div className="inline-flex items-center gap-1 rounded-full bg-[#F8FAFC] px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.16em] text-[#64748B] dark:bg-[rgba(30,41,59,0.88)] dark:text-[#CBD5E1]">
-                    <SparkleIcon className="size-3" weight="fill" />
-                    {node.id === selectedStepId ? 'Selected' : 'Details'}
-                  </div>
-                )}
               </div>
             </div>
           );

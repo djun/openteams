@@ -10,7 +10,7 @@ const STEP_SELECT: &str = r#"
     SELECT id, execution_id, round_id, compiled_revision_id, step_key,
            step_type, title, instructions, assigned_workflow_agent_session_id,
            status, retry_count, max_retry, round_index, display_order,
-           latest_run_id, summary_text,
+           latest_run_id, summary_text, content,
            created_at, updated_at, started_at, completed_at
     FROM chat_workflow_steps
 "#;
@@ -33,6 +33,7 @@ pub struct WorkflowStep {
     pub display_order: i32,
     pub latest_run_id: Option<Uuid>,
     pub summary_text: Option<String>,
+    pub content: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -102,7 +103,7 @@ impl WorkflowStep {
             RETURNING id, execution_id, round_id, compiled_revision_id, step_key,
                       step_type, title, instructions, assigned_workflow_agent_session_id,
                       status, retry_count, max_retry, round_index, display_order,
-                      latest_run_id, summary_text,
+                      latest_run_id, summary_text, content,
                       created_at, updated_at, started_at, completed_at
             "#,
         )
@@ -135,7 +136,7 @@ impl WorkflowStep {
             RETURNING id, execution_id, round_id, compiled_revision_id, step_key,
                       step_type, title, instructions, assigned_workflow_agent_session_id,
                       status, retry_count, max_retry, round_index, display_order,
-                      latest_run_id, summary_text,
+                      latest_run_id, summary_text, content,
                       created_at, updated_at, started_at, completed_at
             "#,
         )
@@ -158,7 +159,7 @@ impl WorkflowStep {
             RETURNING id, execution_id, round_id, compiled_revision_id, step_key,
                       step_type, title, instructions, assigned_workflow_agent_session_id,
                       status, retry_count, max_retry, round_index, display_order,
-                      latest_run_id, summary_text,
+                      latest_run_id, summary_text, content,
                       created_at, updated_at, started_at, completed_at
             "#,
         )
@@ -173,12 +174,14 @@ impl WorkflowStep {
         id: Uuid,
         latest_run_id: Uuid,
         summary_text: Option<String>,
+        content: Option<String>,
     ) -> Result<Self, sqlx::Error> {
         sqlx::query_as::<_, Self>(
             r#"
             UPDATE chat_workflow_steps
             SET latest_run_id = ?2,
                 summary_text = ?3,
+                content = ?4,
                 started_at = COALESCE(started_at, datetime('now', 'subsec')),
                 completed_at = datetime('now', 'subsec'),
                 updated_at = datetime('now', 'subsec')
@@ -186,13 +189,14 @@ impl WorkflowStep {
             RETURNING id, execution_id, round_id, compiled_revision_id, step_key,
                       step_type, title, instructions, assigned_workflow_agent_session_id,
                       status, retry_count, max_retry, round_index, display_order,
-                      latest_run_id, summary_text,
+                      latest_run_id, summary_text, content,
                       created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(id)
         .bind(latest_run_id)
         .bind(summary_text)
+        .bind(content)
         .fetch_one(pool)
         .await
     }
@@ -204,6 +208,7 @@ impl WorkflowStep {
             SET retry_count = retry_count + 1,
                 latest_run_id = NULL,
                 summary_text = NULL,
+                content = NULL,
                 started_at = NULL,
                 completed_at = NULL,
                 updated_at = datetime('now', 'subsec')
@@ -211,7 +216,7 @@ impl WorkflowStep {
             RETURNING id, execution_id, round_id, compiled_revision_id, step_key,
                       step_type, title, instructions, assigned_workflow_agent_session_id,
                       status, retry_count, max_retry, round_index, display_order,
-                      latest_run_id, summary_text,
+                      latest_run_id, summary_text, content,
                       created_at, updated_at, started_at, completed_at
             "#,
         )

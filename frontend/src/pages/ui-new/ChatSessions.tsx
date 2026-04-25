@@ -862,6 +862,7 @@ export function ChatSessions() {
   const {
     streamingRuns,
     streamingRunsBySession,
+    workflowRuntimeLinesByExecution,
     agentStates,
     agentStateInfos,
     runningAgentSessions,
@@ -1207,7 +1208,13 @@ export function ChatSessions() {
       created_at: e.created_at,
     }));
   }, [workflowTranscriptData]);
-  const waitingWorkflowExecutions = useMemo(() => {
+  const workflowRuntimeMessages = useMemo(() => {
+    if (!workflowExecutionId) {
+      return [];
+    }
+    return workflowRuntimeLinesByExecution[workflowExecutionId] ?? [];
+  }, [workflowExecutionId, workflowRuntimeLinesByExecution]);
+  const workflowExecutionCandidates = useMemo(() => {
     const seenExecutionIds = new Set<string>();
     const next: Array<{ messageId: string; executionId: string }> = [];
     for (const message of [...messages].reverse()) {
@@ -1215,12 +1222,7 @@ export function ChatSessions() {
         workflowCardProjectionByMessageId[message.id] ??
         extractWorkflowCardProjection(message.meta);
       const executionId = projection?.execution_id;
-      if (
-        !executionId ||
-        projection.execution_status !== 'waiting' ||
-        projection.state !== 'waiting' ||
-        seenExecutionIds.has(executionId)
-      ) {
+      if (!executionId || seenExecutionIds.has(executionId)) {
         continue;
       }
       seenExecutionIds.add(executionId);
@@ -1228,8 +1230,8 @@ export function ChatSessions() {
     }
     return next;
   }, [messages, workflowCardProjectionByMessageId]);
-  const waitingWorkflowTranscriptQueries = useQueries({
-    queries: waitingWorkflowExecutions.map(({ executionId }) => ({
+  const workflowTranscriptQueries = useQueries({
+    queries: workflowExecutionCandidates.map(({ executionId }) => ({
       queryKey: ['workflowTranscripts', activeSessionId, executionId],
       queryFn: () => {
         if (!activeSessionId) {
@@ -1243,15 +1245,15 @@ export function ChatSessions() {
   });
   const pendingFinalReviewByExecutionId = useMemo(() => {
     const next = new Map<string, WorkflowFinalReviewActionData>();
-    waitingWorkflowExecutions.forEach(({ executionId }, index) => {
-      const entries = waitingWorkflowTranscriptQueries[index]?.data ?? [];
+    workflowExecutionCandidates.forEach(({ executionId }, index) => {
+      const entries = workflowTranscriptQueries[index]?.data ?? [];
       const action = toWorkflowFinalReviewAction(executionId, entries);
       if (action) {
         next.set(executionId, action);
       }
     });
     return next;
-  }, [waitingWorkflowExecutions, waitingWorkflowTranscriptQueries]);
+  }, [workflowExecutionCandidates, workflowTranscriptQueries]);
 
   const resolveActionMutation = useMutation({
     mutationFn: async (
@@ -1369,8 +1371,6 @@ export function ChatSessions() {
         extractWorkflowCardProjection(message.meta);
       return (
         projection?.execution_id &&
-        projection.execution_status === 'waiting' &&
-        projection.state === 'waiting' &&
         pendingFinalReviewByExecutionId.has(projection.execution_id)
       );
     });
@@ -5272,6 +5272,7 @@ export function ChatSessions() {
           sessionId={activeSessionId}
           projection={workflowWindowProjection}
           transcript={workflowTranscriptEntries}
+          runtimeMessages={workflowRuntimeMessages}
           isOpen={workflowWindowOpen}
           onClose={() => {
             setWorkflowWindowOpen(false);

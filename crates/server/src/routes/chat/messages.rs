@@ -497,6 +497,7 @@ async fn build_plan_workflow_card_projection(
             status: "pending".to_string(),
             agent_name: node.data.agent_id.clone(),
             summary_text: None,
+            content: None,
         })
         .collect();
 

@@ -931,6 +931,7 @@ impl ChatRunner {
                     status: "pending".to_string(),
                     agent_name: n.data.agent_id.clone(),
                     summary_text: None,
+                    content: None,
                 })
                 .collect();
 

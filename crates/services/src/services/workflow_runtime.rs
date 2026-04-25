@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
+use chrono::Utc;
 use dashmap::DashMap;
 use db::{
     DBService,
@@ -14,6 +15,7 @@ use db::{
         workflow_plan_revision::WorkflowPlanRevision,
         workflow_step::WorkflowStep,
         workflow_step_edge::WorkflowStepEdge,
+        workflow_transcript::{CreateWorkflowTranscript, WorkflowTranscript},
         workflow_types::{
             WorkflowExecutionStatus, WorkflowPlanJson, WorkflowPlanNode, WorkflowStepStatus,
             WorkflowStepType,
@@ -32,6 +34,7 @@ use executors::{
     profile::{ExecutorConfigs, ExecutorProfileId, canonical_variant_key},
 };
 use futures::StreamExt;
+use json_patch::Patch;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -40,6 +43,8 @@ use tokio_util::io::ReaderStream;
 use ts_rs::TS;
 use utils::{log_msg::LogMsg, msg_store::MsgStore, utf8::Utf8LossyDecoder};
 use uuid::Uuid;
+
+use super::chat_runner::{ChatRunner, ChatStreamDeltaType};
 
 const WORKFLOW_EXECUTION_TIMEOUT: Duration = Duration::from_secs(3600);
 const WORKFLOW_DRAIN_TIMEOUT: Duration = Duration::from_millis(35);
@@ -107,6 +112,7 @@ pub struct WorkflowCardStep {
     pub status: String,
     pub agent_name: Option<String>,
     pub summary_text: Option<String>,
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -196,6 +202,186 @@ pub struct SummaryPayload {
     pub content: Option<String>,
     #[serde(default)]
     pub outputs: Vec<String>,
+}
+
+#[derive(Default)]
+struct WorkflowRuntimeStreamState {
+    last_content_by_index: HashMap<usize, String>,
+    assistant_buffer: String,
+    thinking_buffer: String,
+    error_buffer: String,
+}
+
+impl WorkflowRuntimeStreamState {
+    fn drain_patch_lines(&mut self, patch: &Patch) -> Vec<(ChatStreamDeltaType, String)> {
+        let Some((index, entry)) = extract_normalized_entry_from_patch(patch) else {
+            return Vec::new();
+        };
+
+        let Some(stream_type) = workflow_stream_type_for_entry(&entry.entry_type) else {
+            return Vec::new();
+        };
+
+        let previous = self
+            .last_content_by_index
+            .insert(index, entry.content.clone())
+            .unwrap_or_default();
+        let chunk = if entry.content.starts_with(&previous) {
+            entry.content[previous.len()..].to_string()
+        } else if previous == entry.content {
+            String::new()
+        } else {
+            entry.content
+        };
+
+        self.drain_chunk_lines(stream_type, &chunk)
+    }
+
+    fn drain_chunk_lines(
+        &mut self,
+        stream_type: ChatStreamDeltaType,
+        chunk: &str,
+    ) -> Vec<(ChatStreamDeltaType, String)> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+
+        let normalized = chunk.replace("\r\n", "\n").replace('\r', "\n");
+        let buffer = match stream_type {
+            ChatStreamDeltaType::Assistant => &mut self.assistant_buffer,
+            ChatStreamDeltaType::Thinking => &mut self.thinking_buffer,
+            ChatStreamDeltaType::Error => &mut self.error_buffer,
+        };
+        buffer.push_str(&normalized);
+
+        let mut emitted = Vec::new();
+        while let Some(newline_index) = buffer.find('\n') {
+            let line = buffer[..newline_index].trim();
+            if !line.is_empty() {
+                emitted.push((stream_type.clone(), line.to_string()));
+            }
+            buffer.drain(..=newline_index);
+        }
+
+        emitted
+    }
+
+    fn flush_pending_lines(&mut self) -> Vec<(ChatStreamDeltaType, String)> {
+        let mut emitted = Vec::new();
+
+        for (stream_type, buffer) in [
+            (ChatStreamDeltaType::Assistant, &mut self.assistant_buffer),
+            (ChatStreamDeltaType::Thinking, &mut self.thinking_buffer),
+            (ChatStreamDeltaType::Error, &mut self.error_buffer),
+        ] {
+            let line = buffer.trim();
+            if !line.is_empty() {
+                emitted.push((stream_type, line.to_string()));
+            }
+            buffer.clear();
+        }
+
+        emitted
+    }
+}
+
+fn workflow_stream_type_for_entry(entry_type: &NormalizedEntryType) -> Option<ChatStreamDeltaType> {
+    match entry_type {
+        NormalizedEntryType::Thinking => Some(ChatStreamDeltaType::Thinking),
+        _ => None,
+    }
+}
+
+async fn persist_workflow_runtime_transcript_line(
+    pool: &SqlitePool,
+    execution_id: Uuid,
+    workflow_agent_session_id: Option<Uuid>,
+    step_id: Uuid,
+    content: &str,
+) -> Result<WorkflowTranscript, sqlx::Error> {
+    WorkflowTranscript::create(
+        pool,
+        &CreateWorkflowTranscript {
+            execution_id,
+            round_id: None,
+            workflow_agent_session_id,
+            step_id: Some(step_id),
+            sender_type: "agent".to_string(),
+            entry_type: "thinking".to_string(),
+            content: content.to_string(),
+            meta_json: Some(
+                serde_json::json!({
+                    "source": "workflow_runtime_stream",
+                })
+                .to_string(),
+            ),
+        },
+        Uuid::new_v4(),
+    )
+    .await
+}
+
+fn extract_workflow_thinking_lines_from_history(history: &[LogMsg]) -> Vec<String> {
+    let mut state = WorkflowRuntimeStreamState::default();
+    let mut thinking_lines = Vec::new();
+
+    for message in history {
+        let LogMsg::JsonPatch(patch) = message else {
+            continue;
+        };
+
+        for (stream_type, line) in state.drain_patch_lines(patch) {
+            if matches!(stream_type, ChatStreamDeltaType::Thinking) {
+                thinking_lines.push(line);
+            }
+        }
+    }
+
+    for (stream_type, line) in state.flush_pending_lines() {
+        if matches!(stream_type, ChatStreamDeltaType::Thinking) {
+            thinking_lines.push(line);
+        }
+    }
+
+    thinking_lines
+}
+
+async fn persist_missing_workflow_runtime_thinking_transcripts(
+    pool: &SqlitePool,
+    execution_id: Uuid,
+    workflow_agent_session_id: Option<Uuid>,
+    step_id: Uuid,
+    history: &[LogMsg],
+) -> Result<(), WorkflowRuntimeError> {
+    let thinking_lines = extract_workflow_thinking_lines_from_history(history);
+    if thinking_lines.is_empty() {
+        return Ok(());
+    }
+
+    let has_persisted_thinking = WorkflowTranscript::find_by_step(pool, step_id)
+        .await?
+        .into_iter()
+        .any(|entry| {
+            entry.workflow_agent_session_id == workflow_agent_session_id
+                && entry.sender_type == "agent"
+                && entry.entry_type == "thinking"
+        });
+    if has_persisted_thinking {
+        return Ok(());
+    }
+
+    for line in thinking_lines {
+        persist_workflow_runtime_transcript_line(
+            pool,
+            execution_id,
+            workflow_agent_session_id,
+            step_id,
+            &line,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 pub fn extract_json_payload(raw_output: &str) -> Option<String> {
@@ -624,6 +810,11 @@ pub fn build_workflow_card_projection(
                 .summary_text
                 .clone()
                 .and_then(parse_summary_text_preview),
+            content: step
+                .content
+                .clone()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         })
         .collect::<Vec<_>>();
 
@@ -689,6 +880,120 @@ pub fn build_workflow_card_projection(
     })
 }
 
+async fn finish_workflow_runtime_stream(
+    msg_store: &Arc<MsgStore>,
+    stream_task: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    msg_store.push_finished();
+    if let Some(task) = stream_task.take() {
+        let _ = time::timeout(WORKFLOW_DRAIN_TIMEOUT, task).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_workflow_runtime_stream(
+    pool: SqlitePool,
+    chat_runner: ChatRunner,
+    session_id: Uuid,
+    execution_id: Uuid,
+    workflow_agent_session_id: Option<Uuid>,
+    step_id: Uuid,
+    step_key: String,
+    agent_id: Uuid,
+    agent_name: String,
+    msg_store: Arc<MsgStore>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut state = WorkflowRuntimeStreamState::default();
+        let mut stream = msg_store.history_plus_stream();
+
+        while let Some(item) = stream.next().await {
+            let Ok(LogMsg::JsonPatch(patch)) = item else {
+                continue;
+            };
+
+            for (stream_type, line) in state.drain_patch_lines(&patch) {
+                let created_at = Utc::now().to_rfc3339();
+                match persist_workflow_runtime_transcript_line(
+                    &pool,
+                    execution_id,
+                    workflow_agent_session_id,
+                    step_id,
+                    &line,
+                )
+                .await
+                {
+                    Ok(_) => chat_runner.emit_workflow_runtime_line(
+                        session_id,
+                        execution_id,
+                        workflow_agent_session_id,
+                        step_id,
+                        step_key.clone(),
+                        agent_id,
+                        agent_name.clone(),
+                        stream_type,
+                        line,
+                        created_at,
+                    ),
+                    Err(error) => tracing::warn!(
+                        execution_id = %execution_id,
+                        step_id = %step_id,
+                        workflow_agent_session_id = ?workflow_agent_session_id,
+                        %error,
+                        "failed to persist workflow runtime thinking line"
+                    ),
+                }
+            }
+        }
+
+        for (stream_type, line) in state.flush_pending_lines() {
+            let created_at = Utc::now().to_rfc3339();
+            match persist_workflow_runtime_transcript_line(
+                &pool,
+                execution_id,
+                workflow_agent_session_id,
+                step_id,
+                &line,
+            )
+            .await
+            {
+                Ok(_) => chat_runner.emit_workflow_runtime_line(
+                    session_id,
+                    execution_id,
+                    workflow_agent_session_id,
+                    step_id,
+                    step_key.clone(),
+                    agent_id,
+                    agent_name.clone(),
+                    stream_type,
+                    line,
+                    created_at,
+                ),
+                Err(error) => tracing::warn!(
+                    execution_id = %execution_id,
+                    step_id = %step_id,
+                    workflow_agent_session_id = ?workflow_agent_session_id,
+                    %error,
+                    "failed to persist buffered workflow runtime thinking line"
+                ),
+            }
+        }
+    })
+}
+
+#[derive(Clone)]
+struct WorkflowRuntimeStreamContext {
+    pool: SqlitePool,
+    chat_runner: ChatRunner,
+    session_id: Uuid,
+    execution_id: Uuid,
+    workflow_agent_session_id: Option<Uuid>,
+    step_id: Uuid,
+    step_key: String,
+    agent_id: Uuid,
+    agent_name: String,
+}
+
 pub async fn run_workflow_agent_prompt(
     db: &DBService,
     session: &ChatSession,
@@ -708,6 +1013,42 @@ pub async fn run_workflow_agent_prompt(
         step_id,
         None,
         None,
+        None,
+    )
+    .await
+}
+
+pub async fn run_workflow_step_agent_prompt(
+    db: &DBService,
+    chat_runner: &ChatRunner,
+    session: &ChatSession,
+    agent: &ChatAgent,
+    session_agent: &ChatSessionAgent,
+    workflow_session: Option<&WorkflowAgentSession>,
+    prompt: &str,
+    step: &WorkflowStep,
+) -> Result<String, WorkflowRuntimeError> {
+    run_workflow_agent_prompt_inner(
+        db,
+        session,
+        agent,
+        session_agent,
+        workflow_session,
+        prompt,
+        step.id,
+        None,
+        None,
+        Some(WorkflowRuntimeStreamContext {
+            pool: db.pool.clone(),
+            chat_runner: chat_runner.clone(),
+            session_id: session.id,
+            execution_id: step.execution_id,
+            workflow_agent_session_id: workflow_session.map(|item| item.id),
+            step_id: step.id,
+            step_key: step.step_key.clone(),
+            agent_id: agent.id,
+            agent_name: agent.name.clone(),
+        }),
     )
     .await
 }
@@ -742,6 +1083,53 @@ pub async fn run_workflow_agent_follow_up(
         step_id,
         Some(resume_session_id),
         workflow_session.agent_message_id.as_deref(),
+        None,
+    )
+    .await
+}
+
+pub async fn run_workflow_step_agent_follow_up(
+    db: &DBService,
+    chat_runner: &ChatRunner,
+    session: &ChatSession,
+    agent: &ChatAgent,
+    session_agent: &ChatSessionAgent,
+    workflow_session: &WorkflowAgentSession,
+    prompt: &str,
+    step: &WorkflowStep,
+) -> Result<String, WorkflowRuntimeError> {
+    let resume_session_id = workflow_session
+        .agent_session_id
+        .as_deref()
+        .or(session_agent.agent_session_id.as_deref())
+        .ok_or_else(|| {
+            WorkflowRuntimeError::Validation(format!(
+                "workflow session {} missing persisted agent session id",
+                workflow_session.id
+            ))
+        })?;
+
+    run_workflow_agent_prompt_inner(
+        db,
+        session,
+        agent,
+        session_agent,
+        Some(workflow_session),
+        prompt,
+        step.id,
+        Some(resume_session_id),
+        workflow_session.agent_message_id.as_deref(),
+        Some(WorkflowRuntimeStreamContext {
+            pool: db.pool.clone(),
+            chat_runner: chat_runner.clone(),
+            session_id: session.id,
+            execution_id: step.execution_id,
+            workflow_agent_session_id: Some(workflow_session.id),
+            step_id: step.id,
+            step_key: step.step_key.clone(),
+            agent_id: agent.id,
+            agent_name: agent.name.clone(),
+        }),
     )
     .await
 }
@@ -756,6 +1144,7 @@ async fn run_workflow_agent_prompt_inner(
     step_id: Uuid,
     resume_session_id: Option<&str>,
     reset_to_message_id: Option<&str>,
+    stream_context: Option<WorkflowRuntimeStreamContext>,
 ) -> Result<String, WorkflowRuntimeError> {
     let workspace_path = resolve_workspace_path(session, agent, session_agent);
     fs::create_dir_all(&workspace_path).await?;
@@ -804,6 +1193,20 @@ async fn run_workflow_agent_prompt_inner(
     let msg_store = Arc::new(MsgStore::new());
     spawn_log_forwarders(&mut spawned.child, msg_store.clone())?;
     executor.normalize_logs(msg_store.clone(), workspace_path.as_path());
+    let mut workflow_stream_task = stream_context.as_ref().map(|context| {
+        spawn_workflow_runtime_stream(
+            context.pool.clone(),
+            context.chat_runner.clone(),
+            context.session_id,
+            context.execution_id,
+            context.workflow_agent_session_id,
+            context.step_id,
+            context.step_key.clone(),
+            context.agent_id,
+            context.agent_name.clone(),
+            msg_store.clone(),
+        )
+    });
 
     let mut failed_by_signal = false;
     let mut interrupted = false;
@@ -826,6 +1229,7 @@ async fn run_workflow_agent_prompt_inner(
             Err(_) => {
                 terminate_child(&mut spawned).await;
                 RUNNING_STEPS.remove(&step_id);
+                finish_workflow_runtime_stream(&msg_store, &mut workflow_stream_task).await;
                 return Err(WorkflowRuntimeError::Validation(format!(
                     "workflow 执行超时：{}",
                     agent.name
@@ -838,6 +1242,7 @@ async fn run_workflow_agent_prompt_inner(
                 Ok(Ok(exit_status)) => status = Some(exit_status),
                 Ok(Err(err)) => {
                     RUNNING_STEPS.remove(&step_id);
+                    finish_workflow_runtime_stream(&msg_store, &mut workflow_stream_task).await;
                     return Err(WorkflowRuntimeError::Io(err));
                 }
                 Err(_) => terminate_child(&mut spawned).await,
@@ -849,9 +1254,7 @@ async fn run_workflow_agent_prompt_inner(
 
     // Unregister from the running steps map.
     RUNNING_STEPS.remove(&step_id);
-
-    msg_store.push_finished();
-    time::sleep(WORKFLOW_DRAIN_TIMEOUT).await;
+    finish_workflow_runtime_stream(&msg_store, &mut workflow_stream_task).await;
 
     if interrupted {
         // Ensure the child is cleaned up.
@@ -888,6 +1291,16 @@ async fn run_workflow_agent_prompt_inner(
     let history = msg_store.get_history();
     persist_workflow_runtime_session_ids(&db.pool, session_agent.id, workflow_session, &history)
         .await?;
+    if let Some(context) = stream_context.as_ref() {
+        persist_missing_workflow_runtime_thinking_transcripts(
+            &context.pool,
+            context.execution_id,
+            context.workflow_agent_session_id,
+            context.step_id,
+            &history,
+        )
+        .await?;
+    }
     extract_latest_assistant_from_history(&history).ok_or_else(|| {
         WorkflowRuntimeError::Validation(format!(
             "workflow agent '{}' 没有返回 assistant 输出",

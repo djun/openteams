@@ -250,6 +250,7 @@ async fn apply_workflow_execution_status_migration_shim(
                 display_order                   INTEGER NOT NULL DEFAULT 0,
                 latest_run_id                   BLOB,
                 summary_text                    TEXT,
+                content                         TEXT,
                 created_at                      TEXT    NOT NULL DEFAULT (datetime('now', 'subsec')),
                 updated_at                      TEXT    NOT NULL DEFAULT (datetime('now', 'subsec')),
                 started_at                      TEXT,
@@ -264,13 +265,17 @@ async fn apply_workflow_execution_status_migration_shim(
             INSERT INTO chat_workflow_steps (
                 id, execution_id, round_id, compiled_revision_id, step_key, step_type, title,
                 instructions, assigned_workflow_agent_session_id, status, retry_count,
-                max_retry, round_index, display_order, latest_run_id, summary_text,
+                max_retry, round_index, display_order, latest_run_id, summary_text, content,
                 created_at, updated_at, started_at, completed_at
             )
             SELECT
                 id, execution_id, round_id, compiled_revision_id, step_key, step_type, title,
                 instructions, assigned_workflow_agent_session_id, status, retry_count,
                 max_retry, round_index, display_order, latest_run_id, summary_text,
+                CASE
+                    WHEN json_valid(summary_text) THEN json_extract(summary_text, '$.content')
+                    ELSE NULL
+                END,
                 created_at, updated_at, started_at, completed_at
             FROM chat_workflow_steps_old
             "#,

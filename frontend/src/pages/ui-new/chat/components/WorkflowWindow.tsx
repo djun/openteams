@@ -10,11 +10,11 @@ import {
 } from '@phosphor-icons/react';
 import { chatApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { ChatMarkdown } from '@/components/ui-new/primitives/conversation/ChatMarkdown';
 import { WorkflowGraphBoard } from './WorkflowGraphBoard';
 import {
   parseWorkflowTranscriptMeta,
   toWorkflowFinalReviewAction,
-  WorkflowFinalReviewCard,
 } from './WorkflowFinalReviewCard';
 
 type WorkflowCardStep = {
@@ -25,6 +25,7 @@ type WorkflowCardStep = {
   status: string;
   agent_name?: string | null;
   summary_text?: string | null;
+  content?: string | null;
 };
 
 type WorkflowCardAgent = {
@@ -87,6 +88,309 @@ type WorkflowTranscriptEntry = {
   created_at: string;
 };
 
+type WorkflowRuntimeMessage = {
+  id: string;
+  executionId: string;
+  workflowAgentSessionId: string | null;
+  stepId: string;
+  stepKey: string;
+  agentId: string;
+  agentName: string;
+  streamType: 'assistant' | 'thinking' | 'error';
+  content: string;
+  createdAt: string;
+};
+
+type WorkflowTranscriptSummaryPayload = {
+  summary?: string;
+  content?: string;
+  outputs?: string[];
+};
+
+function mergeAndSortTranscriptEntries(
+  primary: WorkflowTranscriptEntry[],
+  secondary: WorkflowTranscriptEntry[]
+): WorkflowTranscriptEntry[] {
+  const mergedMap = new Map<string, WorkflowTranscriptEntry>();
+
+  for (const entry of primary) {
+    mergedMap.set(entry.id, entry);
+  }
+  for (const entry of secondary) {
+    mergedMap.set(entry.id, entry);
+  }
+
+  return [...mergedMap.values()].sort((left, right) => {
+    const leftAt = Date.parse(left.created_at);
+    const rightAt = Date.parse(right.created_at);
+    return (
+      (Number.isNaN(leftAt) ? 0 : leftAt) -
+      (Number.isNaN(rightAt) ? 0 : rightAt)
+    );
+  });
+}
+
+function parseTranscriptSummaryPayload(
+  metaJson: string | null | undefined
+): WorkflowTranscriptSummaryPayload | null {
+  if (!metaJson) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(metaJson) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const payload = parsed as Record<string, unknown>;
+    return {
+      summary:
+        typeof payload.summary === 'string' ? payload.summary : undefined,
+      content:
+        typeof payload.content === 'string' ? payload.content : undefined,
+      outputs: Array.isArray(payload.outputs)
+        ? payload.outputs.filter(
+            (item): item is string => typeof item === 'string'
+          )
+        : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getTranscriptMarkdown(entry: WorkflowTranscriptEntry): string | null {
+  const payload = parseTranscriptSummaryPayload(entry.meta_json);
+  if (payload?.content) {
+    const content = payload.content.trim();
+    return content.length > 0 ? content : null;
+  }
+
+  if (
+    (entry.entry_type === 'message' && entry.message_type === 'agent') ||
+    entry.entry_type === 'error'
+  ) {
+    const content = entry.content.trim();
+    return content.length > 0 ? content : null;
+  }
+
+  return null;
+}
+
+type WorkflowTranscriptRenderItem =
+  | {
+      kind: 'entry';
+      id: string;
+      entry: WorkflowTranscriptEntry;
+    }
+  | {
+      kind: 'thinking_group';
+      id: string;
+      entries: WorkflowTranscriptEntry[];
+      workflowAgentSessionId?: string | null;
+      stepId?: string | null;
+      agentName?: string | null;
+      createdAt: string;
+      content: string;
+    };
+
+function buildWorkflowTranscriptRenderItems(
+  entries: WorkflowTranscriptEntry[]
+): WorkflowTranscriptRenderItem[] {
+  const items: WorkflowTranscriptRenderItem[] = [];
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.entry_type !== 'thinking') {
+      items.push({
+        kind: 'entry',
+        id: entry.id,
+        entry,
+      });
+      continue;
+    }
+
+    const groupedEntries = [entry];
+    let cursor = index + 1;
+
+    while (cursor < entries.length) {
+      const candidate = entries[cursor];
+      if (
+        candidate.entry_type !== 'thinking' ||
+        candidate.workflow_agent_session_id !== entry.workflow_agent_session_id ||
+        candidate.step_id !== entry.step_id ||
+        candidate.agent_name !== entry.agent_name
+      ) {
+        break;
+      }
+
+      groupedEntries.push(candidate);
+      cursor += 1;
+    }
+
+    items.push({
+      kind: 'thinking_group',
+      id: `thinking-group-${groupedEntries[0].id}`,
+      entries: groupedEntries,
+      workflowAgentSessionId: entry.workflow_agent_session_id,
+      stepId: entry.step_id,
+      agentName: entry.agent_name,
+      createdAt: groupedEntries[0].created_at,
+      content: groupedEntries.map((item) => item.content).join('\n'),
+    });
+
+    index = cursor - 1;
+  }
+
+  return items;
+}
+
+function resolveWorkflowTranscriptStepTitle(
+  entry: Pick<WorkflowTranscriptEntry, 'step_id' | 'step_key'>,
+  stepById: Map<string, WorkflowCardStep>,
+  stepByKey: Map<string, WorkflowCardStep>
+): string | null {
+  const titleFromId = entry.step_id ? stepById.get(entry.step_id)?.title : null;
+  if (titleFromId?.trim()) {
+    return titleFromId.trim();
+  }
+
+  const titleFromKey = entry.step_key
+    ? stepByKey.get(entry.step_key)?.title
+    : null;
+  return titleFromKey?.trim() || null;
+}
+
+function hasAgentTranscriptMessageForStep(
+  entries: WorkflowTranscriptEntry[],
+  stepId?: string | null,
+  stepKey?: string | null
+): boolean {
+  return entries.some(
+    (entry) =>
+      entry.message_type === 'agent' &&
+      entry.entry_type === 'message' &&
+      ((stepId && entry.step_id === stepId) ||
+        (stepKey && entry.step_key === stepKey))
+  );
+}
+
+function buildStepContentTranscriptEntries(
+  steps: WorkflowCardStep[],
+  existingEntries: WorkflowTranscriptEntry[],
+  resolveStepAgentSessionId: (step?: WorkflowCardStep | null) => string | null,
+  selectedWorkflowAgentSessionId?: string | null
+): WorkflowTranscriptEntry[] {
+  let offset = 1;
+
+  return steps
+    .filter((step) => step.content?.trim())
+    .filter((step) => {
+      const workflowAgentSessionId = resolveStepAgentSessionId(step);
+      if (!selectedWorkflowAgentSessionId) {
+        return true;
+      }
+      return workflowAgentSessionId === selectedWorkflowAgentSessionId;
+    })
+    .filter(
+      (step) =>
+        !hasAgentTranscriptMessageForStep(existingEntries, step.id, step.step_key)
+    )
+    .map((step) => {
+      const relatedEntries = existingEntries.filter(
+        (entry) =>
+          entry.step_id === step.id || entry.step_key === step.step_key
+      );
+      const latestRelatedTimestamp = Math.max(
+        ...relatedEntries.map((entry) => Date.parse(entry.created_at)),
+        ...existingEntries.map((entry) => Date.parse(entry.created_at)),
+        Date.now()
+      );
+      const createdAt = new Date(
+        (Number.isFinite(latestRelatedTimestamp)
+          ? latestRelatedTimestamp
+          : Date.now()) + offset
+      ).toISOString();
+      offset += 1;
+
+      return {
+        id: `step-content-${step.id}`,
+        step_id: step.id,
+        step_key: step.step_key,
+        workflow_agent_session_id: resolveStepAgentSessionId(step),
+        agent_name: step.agent_name,
+        message_type: 'agent' as const,
+        entry_type: 'message',
+        content: step.content!.trim(),
+        meta_json: JSON.stringify({
+          source: 'workflow_card_step_content',
+        }),
+        created_at: createdAt,
+      };
+    });
+}
+
+function workflowMessageTone(
+  messageType: WorkflowTranscriptEntry['message_type'],
+  entryType: string
+) {
+  if (entryType === 'approval_request') {
+    return {
+      rail: 'bg-[#F59E0B]',
+      badge: 'bg-[#FFFBEB] text-[#92400E]',
+      label: 'text-[#B45309]',
+    };
+  }
+  if (entryType === 'permission_request') {
+    return {
+      rail: 'bg-[#2563EB]',
+      badge: 'bg-[#EFF6FF] text-[#1D4ED8]',
+      label: 'text-[#1D4ED8]',
+    };
+  }
+  if (entryType === 'continue_confirmation') {
+    return {
+      rail: 'bg-[#16A34A]',
+      badge: 'bg-[#ECFDF5] text-[#166534]',
+      label: 'text-[#15803D]',
+    };
+  }
+  if (entryType === 'input_request') {
+    return {
+      rail: 'bg-[#4F46E5]',
+      badge: 'bg-[#EEF2FF] text-[#3730A3]',
+      label: 'text-[#4338CA]',
+    };
+  }
+  switch (messageType) {
+    case 'agent':
+      return {
+        rail: 'bg-[#2563EB]',
+        badge: 'bg-[#EFF6FF] text-[#1D4ED8]',
+        label: 'text-[#1E3A8A]',
+      };
+    case 'user':
+      return {
+        rail: 'bg-[#16A34A]',
+        badge: 'bg-[#F0FDF4] text-[#166534]',
+        label: 'text-[#166534]',
+      };
+    case 'control':
+      return {
+        rail: 'bg-[#D97706]',
+        badge: 'bg-[#FFF7ED] text-[#9A3412]',
+        label: 'text-[#B45309]',
+      };
+    default:
+      return {
+        rail: 'bg-[#94A3B8]',
+        badge: 'bg-[#F8FAFC] text-[#475569]',
+        label: 'text-[#475569]',
+      };
+  }
+}
+
 const WORKFLOW_COMPOSER_MIN_HEIGHT = 104;
 const WORKFLOW_COMPOSER_MAX_HEIGHT = 192;
 
@@ -98,6 +402,7 @@ export type WorkflowWindowProps = {
   sessionId?: string | null;
   projection: WorkflowWindowProjection;
   transcript?: WorkflowTranscriptEntry[];
+  runtimeMessages?: WorkflowRuntimeMessage[];
   isOpen: boolean;
   onClose: () => void;
   onExecute?: (planId: string) => void;
@@ -399,12 +704,14 @@ function workflowStatusBadgeClass(status?: string | null) {
 }
 
 function WorkflowTranscriptFeed({
+  steps,
   entries,
   isLoading,
   emptyMessage,
   pendingActionId,
   onApproval,
 }: {
+  steps: WorkflowCardStep[];
   entries: WorkflowTranscriptEntry[];
   isLoading?: boolean;
   emptyMessage: string;
@@ -416,6 +723,22 @@ function WorkflowTranscriptFeed({
     inputText?: string
   ) => void;
 }) {
+  const renderItems = useMemo(
+    () => buildWorkflowTranscriptRenderItems(entries),
+    [entries]
+  );
+  const stepById = useMemo(
+    () => new Map(steps.map((step) => [step.id, step])),
+    [steps]
+  );
+  const stepByKey = useMemo(
+    () => new Map(steps.map((step) => [step.step_key, step])),
+    [steps]
+  );
+  const [collapsedThinkingGroups, setCollapsedThinkingGroups] = useState<
+    Record<string, boolean>
+  >({});
+
   if (entries.length === 0) {
     return (
       <div className="flex h-full min-h-[240px] items-center justify-center rounded-[24px] border border-dashed border-[#CBD5E1] bg-[#F8FAFC] px-5 text-center text-sm text-[#94A3B8] dark:border-[#334155] dark:bg-[rgba(15,23,42,0.45)]">
@@ -425,143 +748,239 @@ function WorkflowTranscriptFeed({
   }
 
   return (
-    <div className="space-y-2">
-      {entries.map((entry) => {
-        if (entry.entry_type === 'approval_request') {
-          const meta = parseWorkflowTranscriptMeta(entry.meta_json);
-          const resolved = meta?.resolved === true;
-          return (
-            <ApprovalCard
-              key={entry.id}
-              title={entry.content}
-              description={
-                typeof meta?.description === 'string'
-                  ? meta.description
-                  : undefined
-              }
-              stepId={entry.step_id ?? ''}
-              transcriptId={entry.id}
-              onApprove={(stepId, transcriptId) =>
-                onApproval?.(stepId, 'approved', transcriptId)
-              }
-              onReject={(stepId, transcriptId) =>
-                onApproval?.(stepId, 'rejected', transcriptId)
-              }
-              disabled={
-                !entry.step_id ||
-                resolved ||
-                !onApproval ||
-                pendingActionId === entry.id
-              }
-            />
+    <div className="divide-y divide-[#CBD5E1] dark:divide-[#334155]">
+      {renderItems.map((item) => {
+        if (item.kind === 'thinking_group') {
+          const tone = workflowMessageTone('agent', 'thinking');
+          const collapsed = collapsedThinkingGroups[item.id] ?? true;
+          const stepTitle = resolveWorkflowTranscriptStepTitle(
+            item.entries[0],
+            stepById,
+            stepByKey
           );
-        }
-        if (entry.entry_type === 'permission_request') {
-          const meta = parseWorkflowTranscriptMeta(entry.meta_json);
-          const resolved = meta?.resolved === true;
+          const agentLabel = stepTitle ?? item.agentName ?? 'agent';
+
           return (
-            <PermissionRequestCard
-              key={entry.id}
-              title={entry.content}
-              description={
-                typeof meta?.description === 'string'
-                  ? meta.description
-                  : undefined
-              }
-              stepId={entry.step_id ?? ''}
-              transcriptId={entry.id}
-              onGrant={(stepId, transcriptId) =>
-                onApproval?.(stepId, 'granted', transcriptId)
-              }
-              onDeny={(stepId, transcriptId) =>
-                onApproval?.(stepId, 'denied', transcriptId)
-              }
-              disabled={
-                !entry.step_id ||
-                resolved ||
-                !onApproval ||
-                pendingActionId === entry.id
-              }
-            />
-          );
-        }
-        if (entry.entry_type === 'continue_confirmation') {
-          const resolved =
-            parseWorkflowTranscriptMeta(entry.meta_json)?.resolved === true;
-          return (
-            <ContinueConfirmationCard
-              key={entry.id}
-              message={entry.content}
-              stepId={entry.step_id ?? ''}
-              transcriptId={entry.id}
-              onContinue={(stepId, transcriptId) =>
-                onApproval?.(stepId, 'continued', transcriptId)
-              }
-              disabled={
-                !entry.step_id ||
-                resolved ||
-                !onApproval ||
-                pendingActionId === entry.id
-              }
-            />
-          );
-        }
-        if (entry.entry_type === 'input_request') {
-          const meta = parseWorkflowTranscriptMeta(entry.meta_json);
-          const resolved = meta?.resolved === true;
-          return (
-            <InputRequestCard
-              key={entry.id}
-              prompt={entry.content}
-              description={
-                typeof meta?.description === 'string'
-                  ? meta.description
-                  : undefined
-              }
-              placeholder={
-                typeof meta?.placeholder === 'string'
-                  ? meta.placeholder
-                  : undefined
-              }
-              stepId={entry.step_id ?? ''}
-              transcriptId={entry.id}
-              onSubmit={(stepId, transcriptId, inputText) =>
-                onApproval?.(stepId, 'submitted', transcriptId, inputText)
-              }
-              disabled={
-                !entry.step_id ||
-                resolved ||
-                !onApproval ||
-                pendingActionId === entry.id
-              }
-            />
+            <div key={item.id} className="py-5 first:pt-0 last:pb-0">
+              <div className="flex gap-3">
+                <div className={cn('mt-1 h-4 w-1 shrink-0 rounded-full', tone.rail)} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-3 text-[11px]">
+                    <span
+                      className={cn(
+                        'rounded-full px-2 py-0.5 font-semibold uppercase tracking-[0.14em]',
+                        tone.badge
+                      )}
+                    >
+                      {agentLabel}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCollapsedThinkingGroups((previous) => ({
+                          ...previous,
+                          [item.id]: !collapsed,
+                        }))
+                      }
+                      className="shrink-0 rounded-full border border-[#CBD5E1] bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#64748B] transition-colors hover:bg-[#F8FAFC] dark:border-[#334155] dark:bg-transparent dark:text-[#CBD5E1]"
+                    >
+                      {collapsed
+                        ? `Show ${item.entries.length} line${
+                            item.entries.length === 1 ? '' : 's'
+                          }`
+                        : 'Hide details'}
+                    </button>
+                  </div>
+
+                  {!collapsed && (
+                    <div
+                      className="mt-2 space-y-1 overflow-auto"
+                      style={{ maxHeight: WORKFLOW_COMPOSER_MAX_HEIGHT }}
+                    >
+                      {item.entries.map((thinkingEntry) => (
+                        <div
+                          key={thinkingEntry.id}
+                          className="truncate text-[12px] leading-6 text-[#334155] dark:text-[#CBD5E1]"
+                          title={thinkingEntry.content}
+                        >
+                          {thinkingEntry.content}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
           );
         }
 
+        const { entry } = item;
+        const meta = parseWorkflowTranscriptMeta(entry.meta_json);
+        const tone = workflowMessageTone(entry.message_type, entry.entry_type);
+        const stepTitle = resolveWorkflowTranscriptStepTitle(
+          entry,
+          stepById,
+          stepByKey
+        );
+        const headerLabel = stepTitle ?? entry.agent_name ?? entry.message_type;
+        const secondaryLabel = stepTitle
+          ? entry.agent_name && entry.agent_name !== 'BACKEND'
+            ? entry.agent_name
+            : null
+          : entry.entry_type;
+        const resolved = meta?.resolved === true;
+        const markdownContent = getTranscriptMarkdown(entry);
+        const descriptionText =
+          typeof meta?.description === 'string' ? meta.description : null;
+        const markdownTextClassName =
+          entry.entry_type === 'error'
+            ? 'text-[13px] leading-6 text-[#991B1B] dark:text-[#FECACA]'
+            : 'text-[13px] leading-6 text-[#0F172A] dark:text-white';
+
         return (
-          <div
-            key={entry.id}
-            className={cn(
-              'rounded-[18px] border px-3 py-3 text-xs shadow-[inset_0_1px_0_rgba(255,255,255,0.65)]',
-              entry.message_type === 'system' &&
-                'border-[#E2E8F0] bg-[#F8FAFC] text-[#475569]',
-              entry.message_type === 'agent' &&
-                'border-[#BFDBFE] bg-[#EFF6FF] text-[#1E3A8A]',
-              entry.message_type === 'control' &&
-                'border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]',
-              entry.message_type === 'user' &&
-                'border-[#BBF7D0] bg-[#F0FDF4] text-[#166534]'
-            )}
-          >
-            <div className="mb-1 flex items-center justify-between gap-3">
-              <div className="truncate text-[10px] font-bold uppercase tracking-[0.16em] text-current/75">
-                {entry.agent_name ?? entry.message_type}
-              </div>
-              <div className="text-[10px] uppercase tracking-[0.16em] text-current/60">
-                {entry.entry_type}
+          <div key={entry.id} className="py-5 first:pt-0 last:pb-0">
+            <div className="flex gap-3">
+              <div className={cn('mt-1 h-4 w-1 shrink-0 rounded-full', tone.rail)} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span
+                    className={cn(
+                      'rounded-full px-2 py-0.5 font-semibold uppercase tracking-[0.14em]',
+                      tone.badge
+                    )}
+                  >
+                    {headerLabel}
+                  </span>
+                  {secondaryLabel ? (
+                    <span
+                      className={cn(
+                        'font-medium uppercase tracking-[0.14em]',
+                        tone.label
+                      )}
+                    >
+                      {secondaryLabel}
+                    </span>
+                  ) : null}
+                </div>
+                {markdownContent ? (
+                  <ChatMarkdown
+                    content={markdownContent}
+                    maxWidth="100%"
+                    hideCopyButton
+                    textClassName={markdownTextClassName}
+                    className="mt-2 w-full"
+                  />
+                ) : (
+                  <div className="mt-2 whitespace-pre-wrap text-[13px] leading-6 text-[#0F172A] dark:text-white">
+                    {entry.content}
+                    {entry.entry_type === 'input_request' && descriptionText
+                      ? `\n\n${descriptionText}`
+                      : ''}
+                  </div>
+                )}
+
+                {entry.entry_type !== 'input_request' && descriptionText ? (
+                  <div className="mt-1 whitespace-pre-wrap text-[13px] leading-6 text-[#64748B] dark:text-[#94A3B8]">
+                    {descriptionText}
+                  </div>
+                ) : null}
+
+                {entry.entry_type === 'approval_request' ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        entry.step_id &&
+                        onApproval?.(entry.step_id, 'approved', entry.id)
+                      }
+                      disabled={
+                        !entry.step_id ||
+                        resolved ||
+                        !onApproval ||
+                        pendingActionId === entry.id
+                      }
+                      className="rounded-full bg-[#16A34A] px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-[#15803D] disabled:opacity-50"
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        entry.step_id &&
+                        onApproval?.(entry.step_id, 'rejected', entry.id)
+                      }
+                      disabled={
+                        !entry.step_id ||
+                        resolved ||
+                        !onApproval ||
+                        pendingActionId === entry.id
+                      }
+                      className="rounded-full border border-[#CBD5E1] bg-white px-3 py-1 text-xs font-semibold text-[#475569] transition-colors hover:bg-[#F8FAFC] disabled:opacity-50 dark:border-[#334155] dark:bg-transparent dark:text-[#CBD5E1]"
+                    >
+                      Reject
+                    </button>
+                  </div>
+                ) : null}
+
+                {entry.entry_type === 'permission_request' ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        entry.step_id &&
+                        onApproval?.(entry.step_id, 'granted', entry.id)
+                      }
+                      disabled={
+                        !entry.step_id ||
+                        resolved ||
+                        !onApproval ||
+                        pendingActionId === entry.id
+                      }
+                      className="rounded-full bg-[#2563EB] px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-[#1D4ED8] disabled:opacity-50"
+                    >
+                      Grant
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        entry.step_id &&
+                        onApproval?.(entry.step_id, 'denied', entry.id)
+                      }
+                      disabled={
+                        !entry.step_id ||
+                        resolved ||
+                        !onApproval ||
+                        pendingActionId === entry.id
+                      }
+                      className="rounded-full border border-[#CBD5E1] bg-white px-3 py-1 text-xs font-semibold text-[#475569] transition-colors hover:bg-[#F8FAFC] disabled:opacity-50 dark:border-[#334155] dark:bg-transparent dark:text-[#CBD5E1]"
+                    >
+                      Deny
+                    </button>
+                  </div>
+                ) : null}
+
+                {entry.entry_type === 'continue_confirmation' ? (
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        entry.step_id &&
+                        onApproval?.(entry.step_id, 'continued', entry.id)
+                      }
+                      disabled={
+                        !entry.step_id ||
+                        resolved ||
+                        !onApproval ||
+                        pendingActionId === entry.id
+                      }
+                      className="rounded-full bg-[#16A34A] px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-[#15803D] disabled:opacity-50"
+                    >
+                      Continue
+                    </button>
+                  </div>
+                ) : null}
               </div>
             </div>
-            <div className="whitespace-pre-wrap leading-5">{entry.content}</div>
           </div>
         );
       })}
@@ -577,6 +996,7 @@ export function WorkflowWindow({
   sessionId,
   projection,
   transcript = [],
+  runtimeMessages = [],
   isOpen,
   onClose,
   onExecute,
@@ -584,7 +1004,6 @@ export function WorkflowWindow({
   onResume,
   onInterruptStep,
   onStopStep,
-  onRetryStep,
   onSubmitStepInput,
   onApproval,
   onResolveFinalReview,
@@ -594,7 +1013,11 @@ export function WorkflowWindow({
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [detailStepId, setDetailStepId] = useState<string | null>(null);
   const [composerValue, setComposerValue] = useState('');
+  const [runtimeInputTranscripts, setRuntimeInputTranscripts] = useState<
+    WorkflowTranscriptEntry[]
+  >([]);
   const initializedWorkflowKeyRef = useRef<string | null>(null);
+  const previousExecutionIdRef = useRef<string | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const isPreview =
@@ -609,16 +1032,56 @@ export function WorkflowWindow({
   const agents = useMemo(() => projection.agents ?? [], [projection.agents]);
   const leadAgentId =
     agents[0]?.workflow_agent_session_id ?? agents[0]?.session_agent_id ?? null;
-  const agentSessionIdByName = useMemo(
-    () =>
-      new Map(
-        agents.map((agent) => [
+  const leadAgentName = agents[0]?.name ?? 'Lead';
+  const agentSessionIdByLookup = useMemo(
+    () => {
+      const lookup = new Map<string, string>();
+
+      for (const agent of agents) {
+        const agentSessionId =
+          agent.workflow_agent_session_id ?? agent.session_agent_id;
+        const keys = [
           agent.name,
-          agent.workflow_agent_session_id ?? agent.session_agent_id,
-        ])
-      ),
+          agent.agent_id,
+          agent.session_agent_id,
+          agent.workflow_agent_session_id,
+        ];
+
+        for (const key of keys) {
+          const normalizedKey = key?.trim();
+          if (!normalizedKey || lookup.has(normalizedKey)) {
+            continue;
+          }
+          lookup.set(normalizedKey, agentSessionId);
+        }
+      }
+
+      return lookup;
+    },
     [agents]
   );
+  const agentNameByLookup = useMemo(() => {
+    const lookup = new Map<string, string>();
+
+    for (const agent of agents) {
+      const keys = [
+        agent.name,
+        agent.agent_id,
+        agent.session_agent_id,
+        agent.workflow_agent_session_id,
+      ];
+
+      for (const key of keys) {
+        const normalizedKey = key?.trim();
+        if (!normalizedKey || lookup.has(normalizedKey)) {
+          continue;
+        }
+        lookup.set(normalizedKey, agent.name);
+      }
+    }
+
+    return lookup;
+  }, [agents]);
   const stepByKey = useMemo(
     () => new Map(projection.steps.map((step) => [step.step_key, step])),
     [projection.steps]
@@ -654,17 +1117,28 @@ export function WorkflowWindow({
     () => `${projection.execution_id ?? ''}::${projection.plan_id ?? ''}`,
     [projection.execution_id, projection.plan_id]
   );
+  const resolveStepAgentName = useCallback(
+    (step?: WorkflowCardStep | null) => {
+      const rawAgent = step?.agent_name?.trim();
+      if (!rawAgent) {
+        return leadAgentName;
+      }
+      return agentNameByLookup.get(rawAgent) ?? rawAgent;
+    },
+    [agentNameByLookup, leadAgentName]
+  );
   const resolveStepAgentId = useCallback(
     (step?: WorkflowCardStep | null) => {
       if (!step) {
         return leadAgentId;
       }
-      if (!step.agent_name) {
+      const rawAgent = step.agent_name?.trim();
+      if (!rawAgent) {
         return leadAgentId;
       }
-      return agentSessionIdByName.get(step.agent_name) ?? leadAgentId;
+      return agentSessionIdByLookup.get(rawAgent) ?? leadAgentId;
     },
-    [agentSessionIdByName, leadAgentId]
+    [agentSessionIdByLookup, leadAgentId]
   );
   const findPreferredStepForAgent = useCallback(
     (agentId: string | null) => {
@@ -791,6 +1265,9 @@ export function WorkflowWindow({
     ) ??
     agents[0] ??
     null;
+  const selectedWorkflowAgentSessionId = selectedAgent
+    ? selectedAgent.workflow_agent_session_id ?? selectedAgent.session_agent_id
+    : null;
   const selectedStepInputRequest = useMemo(() => {
     if (!selectedStep || selectedStep.status !== 'waiting_input') {
       return null;
@@ -840,8 +1317,84 @@ export function WorkflowWindow({
   const detailStep = projection.steps.find((s) => s.step_key === detailStepId);
   const detailStepNode = detailStepId ? planNodeById.get(detailStepId) : null;
   const detailAgentSessionId = detailStep?.agent_name
-    ? (agentSessionIdByName.get(detailStep.agent_name) ?? leadAgentId)
+    ? (agentSessionIdByLookup.get(detailStep.agent_name.trim()) ?? leadAgentId)
     : leadAgentId;
+  const liveThinkingTranscriptEntries = useMemo(() => {
+    const persistedThinkingKeys = new Set(
+      transcript
+        .filter((entry) => entry.entry_type === 'thinking')
+        .map(
+          (entry) =>
+            `${entry.workflow_agent_session_id ?? ''}::${entry.step_id ?? ''}::${entry.content}`
+        )
+    );
+
+    return runtimeMessages
+      .filter((entry) => entry.streamType === 'thinking')
+      .map((entry) => ({
+        id: entry.id,
+        step_id: entry.stepId,
+        step_key: entry.stepKey,
+        workflow_agent_session_id: entry.workflowAgentSessionId,
+        agent_name: entry.agentName,
+        message_type: 'agent' as const,
+        entry_type: 'thinking',
+        content: entry.content,
+        meta_json: JSON.stringify({ source: 'workflow_runtime_line' }),
+        created_at: entry.createdAt,
+      }))
+      .filter(
+        (entry) =>
+          !persistedThinkingKeys.has(
+            `${entry.workflow_agent_session_id ?? ''}::${entry.step_id ?? ''}::${entry.content}`
+          )
+      );
+  }, [runtimeMessages, transcript]);
+  const selectedRuntimeTranscript = useMemo(() => {
+    let entries = transcript;
+    if (selectedWorkflowAgentSessionId) {
+      entries = entries.filter(
+        (entry) => entry.workflow_agent_session_id === selectedWorkflowAgentSessionId
+      );
+    }
+    const liveThinkingEntries = liveThinkingTranscriptEntries.filter((entry) => {
+      if (!selectedWorkflowAgentSessionId) {
+        return true;
+      }
+      return entry.workflow_agent_session_id === selectedWorkflowAgentSessionId;
+    });
+    const stepContentEntries = buildStepContentTranscriptEntries(
+      projection.steps,
+      entries,
+      resolveStepAgentId,
+      selectedWorkflowAgentSessionId
+    );
+    const localEntries = runtimeInputTranscripts.filter((entry) => {
+      if (!selectedWorkflowAgentSessionId) {
+        return true;
+      }
+      return entry.workflow_agent_session_id === selectedWorkflowAgentSessionId;
+    });
+
+    return mergeAndSortTranscriptEntries(
+      mergeAndSortTranscriptEntries(
+        mergeAndSortTranscriptEntries(entries, liveThinkingEntries),
+        stepContentEntries
+      ),
+      localEntries
+    );
+  }, [
+    projection.steps,
+    liveThinkingTranscriptEntries,
+    runtimeInputTranscripts,
+    resolveStepAgentId,
+    transcript,
+    selectedWorkflowAgentSessionId,
+  ]);
+  const transcriptWithLocalInputs = useMemo(
+    () => mergeAndSortTranscriptEntries(transcript, runtimeInputTranscripts),
+    [runtimeInputTranscripts, transcript]
+  );
 
   const {
     data: detailStepTranscriptData,
@@ -873,7 +1426,7 @@ export function WorkflowWindow({
       return [];
     }
 
-    let entries = transcript.filter(
+    let entries = transcriptWithLocalInputs.filter(
       (entry) =>
         entry.step_id === detailStep.id ||
         entry.step_key === detailStep.step_key
@@ -884,11 +1437,11 @@ export function WorkflowWindow({
       );
     }
     return entries;
-  }, [detailAgentSessionId, detailStep, transcript]);
+  }, [detailAgentSessionId, detailStep, transcriptWithLocalInputs]);
 
   const detailStepScopedTranscript = useMemo(() => {
     const entries = detailStepTranscriptData ?? [];
-    return entries.map((entry) => ({
+    const remoteEntries = entries.map((entry) => ({
       id: entry.id,
       step_id: entry.step_id,
       step_key: entry.step_key,
@@ -904,7 +1457,30 @@ export function WorkflowWindow({
       meta_json: entry.meta_json,
       created_at: entry.created_at,
     }));
-  }, [detailStepTranscriptData]);
+    const localEntries = transcriptWithLocalInputs.filter(
+      (entry) =>
+        entry.step_id === detailStep?.id ||
+        entry.step_key === detailStep?.step_key
+    );
+    const mergedEntries = mergeAndSortTranscriptEntries(remoteEntries, localEntries);
+    const stepContentEntries = detailStep
+      ? buildStepContentTranscriptEntries(
+          [detailStep],
+          mergedEntries,
+          resolveStepAgentId,
+          detailAgentSessionId
+        )
+      : [];
+    return mergeAndSortTranscriptEntries(mergedEntries, stepContentEntries);
+  }, [
+    detailAgentSessionId,
+    detailStep,
+    detailStep?.id,
+    detailStep?.step_key,
+    detailStepTranscriptData,
+    resolveStepAgentId,
+    transcriptWithLocalInputs,
+  ]);
 
   const visibleDetailTranscript =
     detailStepScopedTranscript.length > 0
@@ -935,6 +1511,51 @@ export function WorkflowWindow({
     },
     [findPreferredStepForAgent]
   );
+  const handleSendStepInput = useCallback(() => {
+    if (!selectedStep || !onSubmitStepInput) {
+      return;
+    }
+    const nextValue = composerValue.trim();
+    if (!nextValue) {
+      return;
+    }
+
+    onSubmitStepInput(selectedStep.id, nextValue);
+
+    setRuntimeInputTranscripts((previous) => [
+      ...previous,
+      {
+        id: `runtime-user-${Date.now()}-${Math.floor(Math.random() * 99999)}`,
+        step_id: selectedStep.id,
+        step_key: selectedStep.step_key,
+        workflow_agent_session_id: selectedWorkflowAgentSessionId,
+        agent_name: 'You',
+        message_type: 'user',
+        entry_type: 'message',
+        content: nextValue,
+        meta_json: JSON.stringify({ source: 'workflow_window_input' }),
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    setComposerValue('');
+  }, [
+    composerValue,
+    onSubmitStepInput,
+    selectedStep,
+    selectedWorkflowAgentSessionId,
+  ]);
+
+  useEffect(() => {
+    if (!isOpen || !projection.execution_id) {
+      setRuntimeInputTranscripts([]);
+      return;
+    }
+
+    if (previousExecutionIdRef.current !== projection.execution_id) {
+      previousExecutionIdRef.current = projection.execution_id;
+      setRuntimeInputTranscripts([]);
+    }
+  }, [isOpen, projection.execution_id]);
 
   if (!isOpen) return null;
 
@@ -1001,9 +1622,9 @@ export function WorkflowWindow({
               nodes={projection.plan.nodes}
               edges={projection.plan.edges}
               steps={projection.steps}
+              agents={agents}
               selectedStepId={selectedStepId}
               onSelectStep={handleSelectStep}
-              onRetryStep={onRetryStep}
             />
 
             <div className="mt-4 flex items-center justify-between gap-3 rounded-[22px] border border-white/70 bg-white/80 px-4 py-3 text-xs text-[#475569] shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] dark:border-[#243041] dark:bg-[rgba(15,23,42,0.78)] dark:text-[#CBD5E1]">
@@ -1013,7 +1634,7 @@ export function WorkflowWindow({
                 </div>
                 <div className="mt-1 text-xs leading-5 text-[#475569] dark:text-[#CBD5E1]">
                   Click a step node to open its detail card with task
-                  instructions, summary, agent, status and transcript.
+                  instructions, agent, status and transcript.
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
                   <span className="rounded-full bg-[#EEF4FF] px-2.5 py-1 font-semibold text-[#1D4ED8] dark:bg-[rgba(37,99,235,0.18)] dark:text-[#BFDBFE]">
@@ -1113,38 +1734,81 @@ export function WorkflowWindow({
                     />
                   </div>
                 )}
-                <div className="relative min-h-0 flex-1">
-                  <div className="h-full overflow-auto px-5 pb-28 pt-4 md:px-6">
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <div className="min-h-0 flex-1 overflow-auto px-5 pt-4 md:px-6">
                     {workflowFinalReviewAction && onResolveFinalReview && (
-                      <div className="mb-3">
-                        <WorkflowFinalReviewCard
-                          message={workflowFinalReviewAction.message}
-                          description={workflowFinalReviewAction.description}
-                          onAccept={() =>
-                            onResolveFinalReview(
-                              workflowFinalReviewAction.executionId,
-                              workflowFinalReviewAction.transcriptId,
-                              'accepted'
-                            )
-                          }
-                          onReject={() =>
-                            onResolveFinalReview(
-                              workflowFinalReviewAction.executionId,
-                              workflowFinalReviewAction.transcriptId,
-                              'rejected'
-                            )
-                          }
-                          disabled={
-                            pendingActionId ===
-                            workflowFinalReviewAction.transcriptId
-                          }
-                        />
+                      <div className="mb-5 flex gap-3">
+                        <div className="mt-1 h-4 w-1 shrink-0 rounded-full bg-[#7C3AED]" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 text-[11px]">
+                            <span className="rounded-full bg-[#F3E8FF] px-2 py-0.5 font-semibold uppercase tracking-[0.14em] text-[#7C3AED]">
+                              workflow
+                            </span>
+                            <span className="font-medium uppercase tracking-[0.14em] text-[#7C3AED]">
+                              final review
+                            </span>
+                          </div>
+                          <div className="mt-2 whitespace-pre-wrap text-[13px] leading-6 text-[#0F172A] dark:text-white">
+                            {workflowFinalReviewAction.message}
+                          </div>
+                          {workflowFinalReviewAction.description ? (
+                            <div className="mt-1 whitespace-pre-wrap text-[13px] leading-6 text-[#64748B] dark:text-[#94A3B8]">
+                              {workflowFinalReviewAction.description}
+                            </div>
+                          ) : null}
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onResolveFinalReview(
+                                  workflowFinalReviewAction.executionId,
+                                  workflowFinalReviewAction.transcriptId,
+                                  'accepted'
+                                )
+                              }
+                              disabled={
+                                pendingActionId ===
+                                workflowFinalReviewAction.transcriptId
+                              }
+                              className="rounded-full bg-[#16A34A] px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-[#15803D] disabled:opacity-50"
+                            >
+                              Accept
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onResolveFinalReview(
+                                  workflowFinalReviewAction.executionId,
+                                  workflowFinalReviewAction.transcriptId,
+                                  'rejected'
+                                )
+                              }
+                              disabled={
+                                pendingActionId ===
+                                workflowFinalReviewAction.transcriptId
+                              }
+                              className="rounded-full border border-[#CBD5E1] bg-white px-3 py-1 text-xs font-semibold text-[#475569] transition-colors hover:bg-[#F8FAFC] disabled:opacity-50 dark:border-[#334155] dark:bg-transparent dark:text-[#CBD5E1]"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     )}
+                    <WorkflowTranscriptFeed
+                      steps={projection.steps}
+                      entries={selectedRuntimeTranscript}
+                      isLoading={false}
+                      emptyMessage={
+                        isRunning
+                          ? 'Execution has not produced runtime messages yet.'
+                          : 'No runtime messages for this agent yet.'
+                      }
+                    />
                   </div>
 
-                  <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-white/96 via-white/82 to-transparent px-5 pb-3 pt-8 dark:from-[rgba(15,23,42,0.96)] dark:via-[rgba(15,23,42,0.72)] dark:to-transparent md:px-6">
-                    <div className="pointer-events-auto relative">
+                  <div className="border-t border-white bg-white px-5 pb-3 pt-3 dark:border-white dark:bg-white md:px-6">
+                    <div className="relative">
                       {selectedStepInputRequest && (
                         <div className="mb-2 rounded-2xl border border-[#C7D2FE] bg-[#EEF2FF] px-4 py-3 text-xs text-[#3730A3] dark:border-[#312E81] dark:bg-[rgba(49,46,129,0.24)] dark:text-[#C7D2FE]">
                           <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#4338CA] dark:text-[#A5B4FC]">
@@ -1177,17 +1841,7 @@ export function WorkflowWindow({
                       />
                       <button
                         type="button"
-                        onClick={() => {
-                          if (!selectedStep || !onSubmitStepInput) {
-                            return;
-                          }
-                          const nextValue = composerValue.trim();
-                          if (!nextValue) {
-                            return;
-                          }
-                          onSubmitStepInput(selectedStep.id, nextValue);
-                          setComposerValue('');
-                        }}
+                        onClick={handleSendStepInput}
                         disabled={
                           !selectedStep ||
                           !onSubmitStepInput ||
@@ -1235,7 +1889,9 @@ export function WorkflowWindow({
                   </div>
                   <div className="mt-2 text-xs text-[#64748B] dark:text-[#94A3B8]">
                     {detailStep.step_type}
-                    {detailStep.agent_name ? ` · ${detailStep.agent_name}` : ''}
+                    {detailStep.agent_name
+                      ? ` · ${resolveStepAgentName(detailStep)}`
+                      : ''}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -1307,7 +1963,7 @@ export function WorkflowWindow({
                         Agent
                       </div>
                       <div className="mt-2 text-sm font-semibold text-[#0F172A] dark:text-white">
-                        {detailStep.agent_name?.trim() || 'Lead'}
+                        {resolveStepAgentName(detailStep)}
                       </div>
                     </div>
                     <div className="rounded-[22px] border border-white/70 bg-white/82 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.68)] dark:border-[#243041] dark:bg-[rgba(15,23,42,0.72)]">
@@ -1334,6 +1990,7 @@ export function WorkflowWindow({
                   </div>
                   <div className="mt-3 min-h-0 flex-1 overflow-auto pr-1">
                     <WorkflowTranscriptFeed
+                      steps={projection.steps}
                       entries={visibleDetailTranscript}
                       isLoading={isFetchingDetailStepTranscript}
                       emptyMessage={

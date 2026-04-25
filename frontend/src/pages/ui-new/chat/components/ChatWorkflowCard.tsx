@@ -62,6 +62,7 @@ type WorkflowCardProjectionInternal = {
     status: string;
     agent_name?: string | null;
     summary_text?: string | null;
+    content?: string | null;
   }>;
   agents?: Array<{
     session_agent_id: string;
@@ -218,6 +219,7 @@ export function ChatWorkflowCard({
           nodes={projection.plan.nodes}
           edges={projection.plan.edges}
           steps={projection.steps}
+          agents={projection.agents}
           compact
         />
       </div>
@@ -280,32 +282,29 @@ export function ChatWorkflowCard({
           )}
       </div>
 
-      {projection.state === 'waiting' &&
-        projection.execution_status === 'waiting' &&
-        finalReviewAction &&
-        onResolveFinalReview && (
-          <div className="mt-4">
-            <WorkflowFinalReviewCard
-              message={finalReviewAction.message}
-              description={finalReviewAction.description}
-              onAccept={() =>
-                onResolveFinalReview(
-                  finalReviewAction.executionId,
-                  finalReviewAction.transcriptId,
-                  'accepted'
-                )
-              }
-              onReject={() =>
-                onResolveFinalReview(
-                  finalReviewAction.executionId,
-                  finalReviewAction.transcriptId,
-                  'rejected'
-                )
-              }
-              disabled={pendingActionId === finalReviewAction.transcriptId}
-            />
-          </div>
-        )}
+      {finalReviewAction && onResolveFinalReview && (
+        <div className="mt-4">
+          <WorkflowFinalReviewCard
+            message={finalReviewAction.message}
+            description={finalReviewAction.description}
+            onAccept={() =>
+              onResolveFinalReview(
+                finalReviewAction.executionId,
+                finalReviewAction.transcriptId,
+                'accepted'
+              )
+            }
+            onReject={() =>
+              onResolveFinalReview(
+                finalReviewAction.executionId,
+                finalReviewAction.transcriptId,
+                'rejected'
+              )
+            }
+            disabled={pendingActionId === finalReviewAction.transcriptId}
+          />
+        </div>
+      )}
 
       {projection.state === 'completed' && (
         <div className="mt-4 rounded-[24px] border border-[#D1FAE5] bg-[#ECFDF5] p-4">

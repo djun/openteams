@@ -147,6 +147,7 @@ export interface WorkflowCardData {
     status: string;
     agent_name?: string | null;
     summary_text?: string | null;
+    content?: string | null;
   }>;
   agents?: Array<{
     session_agent_id: string;
