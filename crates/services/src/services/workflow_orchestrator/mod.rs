@@ -1,4 +1,4 @@
-﻿//! Workflow Orchestrator 骨架
+//! Workflow Orchestrator 骨架
 //!
 //! Phase 1a 职责：
 //! - command handler: 接收 bootstrap 命令
@@ -561,15 +561,7 @@ impl WorkflowOrchestrator {
             // All steps completed → execution is now Waiting for user final review.
             if execution.status == WorkflowExecutionStatus::Waiting {
                 let all_steps = WorkflowStep::find_by_execution(pool, execution.id).await?;
-                let all_steps_completed = all_steps.iter().all(|step| {
-                    matches!(
-                        step.status,
-                        WorkflowStepStatus::Completed
-                            | WorkflowStepStatus::Skipped
-                            | WorkflowStepStatus::Cancelled
-                    )
-                });
-                if all_steps_completed {
+                if Self::all_steps_completed_like(&all_steps) {
                     Self::park_for_final_review(pool, chat_runner, &execution).await?;
                     return Ok(());
                 }
@@ -702,6 +694,9 @@ async fn load_agents_for_session(
 }
 
 impl WorkflowOrchestrator {
+    const FINAL_REVIEW_CONTENT: &'static str = "任务已完成，是否接受结果？";
+    const FINAL_REVIEW_DESCRIPTION: &'static str = "所有任务步骤已执行完毕，等待用户确认最终结果。";
+
     fn parse_step_output_message(
         execution_id: Uuid,
         step: &WorkflowStep,
@@ -834,6 +829,7 @@ impl WorkflowOrchestrator {
             .ok_or_else(|| {
                 OrchestratorError::NotFound(format!("execution {} 未找到", execution_id))
             })?;
+        Self::ensure_waiting_final_review_invariant(pool, &execution).await?;
         let plan = WorkflowPlan::find_by_id(pool, execution.plan_id)
             .await?
             .ok_or_else(|| {
@@ -906,6 +902,12 @@ impl WorkflowOrchestrator {
             && execution.completed_at.is_none()
         {
             execution = WorkflowExecution::set_completed(pool, execution.id).await?;
+        }
+
+        if execution.status == WorkflowExecutionStatus::Waiting
+            && Self::all_steps_completed_like(&steps)
+        {
+            let _ = Self::ensure_unresolved_final_review(pool, execution.id).await?;
         }
 
         let workflow_sessions = WorkflowAgentSession::find_by_execution(pool, execution.id).await?;
@@ -992,6 +994,43 @@ impl WorkflowOrchestrator {
         Ok(transitioned)
     }
 
+    /// Like `transition_step_and_sync` but uses a CAS guard at the DB level.
+    /// Returns `Ok(None)` if the step was already claimed by another caller
+    /// (stale transition), allowing the caller to skip without error.
+    async fn guarded_transition_step_and_sync(
+        pool: &SqlitePool,
+        chat_runner: &ChatRunner,
+        execution: &WorkflowExecution,
+        step: &WorkflowStep,
+        to: WorkflowStepStatus,
+        projection_reason: &str,
+    ) -> Result<Option<WorkflowStep>, OrchestratorError> {
+        match reducer::guarded_transition_step(pool, execution, step, to).await {
+            Ok(result) => {
+                let transitioned = result.entity;
+                let _ = Self::synchronize_runtime_state(pool, execution.id, false).await?;
+                Self::refresh_execution_projection_with_reason(
+                    pool,
+                    chat_runner,
+                    execution.id,
+                    None,
+                    projection_reason,
+                    vec![transitioned.id.to_string()],
+                )
+                .await?;
+                Ok(Some(transitioned))
+            }
+            Err(reducer::TransitionError::StaleTransition { .. }) => {
+                tracing::info!(
+                    step_id = %step.id,
+                    "跳过已被占用的 step (CAS 失败)"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn retry_step(
         db: &DBService,
         chat_runner: &ChatRunner,
@@ -1051,18 +1090,7 @@ impl WorkflowOrchestrator {
                 OrchestratorError::NotFound(format!("execution {} 未找到", step.execution_id))
             })?;
 
-        if step.status != WorkflowStepStatus::Failed {
-            return Err(OrchestratorError::IllegalTransition(format!(
-                "step {} is {:?}, expected failed",
-                step.id, step.status
-            )));
-        }
-        if step.retry_count >= step.max_retry + 1 {
-            return Err(OrchestratorError::IllegalTransition(format!(
-                "step {} exceeded max retry {}",
-                step.id, step.max_retry
-            )));
-        }
+        Self::validate_step_retry_candidate(&step)?;
 
         let prepared_step = WorkflowStep::prepare_retry(pool, step.id).await?;
         let ready_step = Self::transition_step_and_sync(
@@ -1076,6 +1104,71 @@ impl WorkflowOrchestrator {
         .await?;
 
         Ok((execution, ready_step))
+    }
+
+    fn validate_step_retry_candidate(step: &WorkflowStep) -> Result<(), OrchestratorError> {
+        if !matches!(
+            step.status,
+            WorkflowStepStatus::Failed | WorkflowStepStatus::Interrupted
+        ) {
+            return Err(OrchestratorError::IllegalTransition(format!(
+                "step {} is {:?}, expected failed or interrupted",
+                step.id, step.status
+            )));
+        }
+        if step.retry_count >= step.max_retry {
+            return Err(OrchestratorError::IllegalTransition(format!(
+                "step {} exceeded max retry {}",
+                step.id, step.max_retry
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn all_steps_completed_like(steps: &[WorkflowStep]) -> bool {
+        !steps.is_empty()
+            && steps.iter().all(|step| {
+                matches!(
+                    step.status,
+                    WorkflowStepStatus::Completed
+                        | WorkflowStepStatus::Skipped
+                        | WorkflowStepStatus::Cancelled
+                )
+            })
+    }
+
+    async fn ensure_waiting_final_review_invariant(
+        pool: &SqlitePool,
+        execution: &WorkflowExecution,
+    ) -> Result<Option<WorkflowTranscript>, OrchestratorError> {
+        if execution.status != WorkflowExecutionStatus::Waiting {
+            return Ok(None);
+        }
+
+        let steps = WorkflowStep::find_by_execution(pool, execution.id).await?;
+        if !Self::all_steps_completed_like(&steps) {
+            return Ok(None);
+        }
+
+        Self::ensure_unresolved_final_review(pool, execution.id)
+            .await
+            .map(Some)
+    }
+
+    async fn ensure_unresolved_final_review(
+        pool: &SqlitePool,
+        execution_id: Uuid,
+    ) -> Result<WorkflowTranscript, OrchestratorError> {
+        WorkflowTranscript::create_unresolved_final_review_if_missing(
+            pool,
+            execution_id,
+            Self::FINAL_REVIEW_CONTENT,
+            Self::FINAL_REVIEW_DESCRIPTION,
+            Uuid::new_v4(),
+        )
+        .await
+        .map_err(OrchestratorError::Database)
     }
 
     async fn retry_single_step_only(
@@ -1557,7 +1650,7 @@ impl WorkflowOrchestrator {
                 mode,
             );
             tracing::debug!(
-                follow_up_prompt=follow_up_prompt,
+                follow_up_prompt = follow_up_prompt,
                 "submit step input for following up prompt"
             );
 
@@ -1878,24 +1971,7 @@ impl WorkflowOrchestrator {
         chat_runner: &ChatRunner,
         execution: &WorkflowExecution,
     ) -> Result<WorkflowTranscript, OrchestratorError> {
-        let meta_json = serde_json::json!({
-            "resolved": false,
-            "description": "所有任务步骤已执行完毕，等待用户确认最终结果。",
-        })
-        .to_string();
-
-        let transcript = Self::write_transcript(
-            pool,
-            execution.id,
-            None,
-            None,
-            None,
-            "control",
-            "final_review",
-            "任务已完成，是否接受结果？",
-            Some(&meta_json),
-        )
-        .await?;
+        let transcript = Self::ensure_unresolved_final_review(pool, execution.id).await?;
 
         Self::refresh_execution_projection_with_reason(
             pool,
@@ -2755,14 +2831,61 @@ impl WorkflowOrchestrator {
             .ok_or_else(|| {
                 OrchestratorError::NotFound(format!("execution {} 未找到", execution_id))
             })?;
-        let execution = Self::synchronize_runtime_state(pool, execution.id, false).await?;
 
-        if execution.status != WorkflowExecutionStatus::Paused {
+        // Accept pause from Running (interrupt active steps) or already-Paused states.
+        if !matches!(
+            execution.status,
+            WorkflowExecutionStatus::Running | WorkflowExecutionStatus::Paused
+        ) {
             return Err(OrchestratorError::IllegalTransition(format!(
-                "cannot pause while a step is still active: execution is {:?}",
+                "cannot pause: execution is {:?}, expected running or paused",
                 execution.status
             )));
         }
+
+        // Interrupt all currently running steps so no agent work remains active.
+        let steps = WorkflowStep::find_by_execution(pool, execution.id).await?;
+        for step in &steps {
+            if step.status == WorkflowStepStatus::Running {
+                cancel_running_step(step.id);
+                let interrupt_requested = Self::transition_step_and_sync(
+                    pool,
+                    chat_runner,
+                    &execution,
+                    step,
+                    WorkflowStepStatus::InterruptRequested,
+                    "step_interrupt_requested",
+                )
+                .await?;
+                let _ = Self::transition_step_and_sync(
+                    pool,
+                    chat_runner,
+                    &execution,
+                    &interrupt_requested,
+                    WorkflowStepStatus::Interrupted,
+                    "step_interrupted",
+                )
+                .await?;
+            }
+        }
+
+        // Re-synchronize after interrupting all running steps.
+        let execution = Self::synchronize_runtime_state(pool, execution.id, false).await?;
+
+        // If execution didn't naturally land on Paused, explicitly transition to Paused.
+        let execution = if execution.status != WorkflowExecutionStatus::Paused {
+            Self::transition_execution_and_sync(
+                pool,
+                chat_runner,
+                &execution,
+                WorkflowExecutionStatus::Paused,
+                "execution_paused",
+                None,
+            )
+            .await?
+        } else {
+            execution
+        };
 
         Self::refresh_execution_projection_with_reason(
             pool,
@@ -3201,7 +3324,9 @@ Rules:
                 OrchestratorError::NotFound(format!("agent {} 未找到", session_agent.agent_id))
             })?;
 
-        let running_step = Self::transition_step_and_sync(
+        // Use guarded (CAS) transition for Ready -> Running to prevent
+        // duplicate step execution from concurrent scheduler wake-ups.
+        let running_step = match Self::guarded_transition_step_and_sync(
             pool,
             chat_runner,
             execution,
@@ -3209,7 +3334,14 @@ Rules:
             WorkflowStepStatus::Running,
             "step_started",
         )
-        .await?;
+        .await?
+        {
+            Some(s) => s,
+            None => {
+                // Another scheduler already claimed this step; skip silently.
+                return Ok(StepOutcome::Completed);
+            }
+        };
 
         let _ = Self::write_transcript(
             pool,
@@ -3537,5 +3669,56 @@ mod tests {
         assert!(prompt.contains("Previous attempt ended with an error."));
         assert!(prompt.contains("I have provided the missing dependency data."));
         assert!(prompt.contains("Resume from the failed point"));
+    }
+
+    #[test]
+    fn retry_candidate_accepts_failed_and_interrupted_only_with_remaining_budget() {
+        let failed = sample_step(WorkflowStepStatus::Failed, None);
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&failed).is_ok());
+
+        let interrupted = sample_step(WorkflowStepStatus::Interrupted, None);
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&interrupted).is_ok());
+
+        let running = sample_step(WorkflowStepStatus::Running, None);
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&running).is_err());
+    }
+
+    #[test]
+    fn retry_candidate_treats_max_retry_as_retries_after_first_attempt() {
+        let mut step = sample_step(WorkflowStepStatus::Failed, None);
+
+        step.max_retry = 0;
+        step.retry_count = 0;
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&step).is_err());
+
+        step.max_retry = 1;
+        step.retry_count = 0;
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&step).is_ok());
+        step.retry_count = 1;
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&step).is_err());
+
+        step.max_retry = 2;
+        step.retry_count = 1;
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&step).is_ok());
+        step.retry_count = 2;
+        assert!(WorkflowOrchestrator::validate_step_retry_candidate(&step).is_err());
+    }
+
+    #[test]
+    fn completed_like_final_review_invariant_requires_only_completed_terminal_steps() {
+        assert!(!WorkflowOrchestrator::all_steps_completed_like(&[]));
+
+        let steps = vec![
+            sample_step(WorkflowStepStatus::Completed, None),
+            sample_step(WorkflowStepStatus::Skipped, None),
+            sample_step(WorkflowStepStatus::Cancelled, None),
+        ];
+        assert!(WorkflowOrchestrator::all_steps_completed_like(&steps));
+
+        let steps = vec![
+            sample_step(WorkflowStepStatus::Completed, None),
+            sample_step(WorkflowStepStatus::Failed, None),
+        ];
+        assert!(!WorkflowOrchestrator::all_steps_completed_like(&steps));
     }
 }

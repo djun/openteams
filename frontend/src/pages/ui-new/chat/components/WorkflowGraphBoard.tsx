@@ -1,7 +1,14 @@
-import { ArrowClockwiseIcon } from '@phosphor-icons/react';
-import { useMemo, useState } from 'react';
+import {
+  ArrowClockwiseIcon,
+  ArrowsInSimpleIcon,
+  ArrowsOutSimpleIcon,
+  MagnifyingGlassMinusIcon,
+  MagnifyingGlassPlusIcon,
+} from '@phosphor-icons/react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
+import { isRetryableWorkflowStepStatus } from './workflowControlContract';
 
 type WorkflowGraphStep = {
   id: string;
@@ -67,6 +74,10 @@ type RenderEdge = {
   path: string;
 };
 
+const MIN_NODE_SCALE = 0.82;
+const MAX_NODE_SCALE = 1.36;
+const NODE_SCALE_STEP = 0.09;
+
 function statusTone(status?: string | null, selected?: boolean) {
   const base = (() => {
     switch (status) {
@@ -91,6 +102,13 @@ function statusTone(status?: string | null, selected?: boolean) {
           border: '#DC2626',
           accent: 'rgba(239,68,68,0.18)',
           glow: 'shadow-[0_20px_40px_rgba(220,38,38,0.12)]',
+        };
+      case 'interrupt_requested':
+        return {
+          badge: 'bg-[#FEF3C7] text-[#92400E]',
+          border: '#D97706',
+          accent: 'rgba(245,158,11,0.18)',
+          glow: 'shadow-[0_20px_40px_rgba(217,119,6,0.12)]',
         };
       case 'ready':
         return {
@@ -127,18 +145,19 @@ function layoutGraph(
   nodes: WorkflowGraphNode[],
   edges: WorkflowGraphEdge[],
   steps: WorkflowGraphStep[],
-  compact: boolean
+  compact: boolean,
+  nodeScale: number
 ) {
   if (nodes.length === 0) {
     return null;
   }
 
-  const cardWidth = compact ? 184 : 208;
-  const cardHeight = compact ? 104 : 118;
-  const horizontalGap = compact ? 44 : 60;
-  const verticalGap = compact ? 18 : 24;
-  const paddingX = compact ? 24 : 36;
-  const paddingY = compact ? 24 : 36;
+  const cardWidth = Math.round((compact ? 184 : 208) * nodeScale);
+  const cardHeight = Math.round((compact ? 104 : 118) * nodeScale);
+  const horizontalGap = Math.round((compact ? 44 : 60) * nodeScale);
+  const verticalGap = Math.round((compact ? 18 : 24) * nodeScale);
+  const paddingX = Math.round((compact ? 24 : 36) * nodeScale);
+  const paddingY = Math.round((compact ? 24 : 36) * nodeScale);
   const verticalScale = 2;
 
   const sortedNodes = [...nodes].sort(
@@ -346,6 +365,10 @@ function buildSmoothStepPath({
   ].join(' ');
 }
 
+function clampNodeScale(value: number) {
+  return Math.min(MAX_NODE_SCALE, Math.max(MIN_NODE_SCALE, value));
+}
+
 export function WorkflowGraphBoard({
   nodes,
   edges,
@@ -360,18 +383,29 @@ export function WorkflowGraphBoard({
 }: WorkflowGraphBoardProps) {
   const { t } = useTranslation('chat');
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [nodeScale, setNodeScale] = useState(1);
+  useEffect(() => {
+    if (!isFullscreen) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsFullscreen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isFullscreen]);
   const layout = useMemo(
-    () => layoutGraph(nodes, edges, steps, compact),
-    [compact, edges, nodes, steps]
+    () => layoutGraph(nodes, edges, steps, compact, nodeScale),
+    [compact, edges, nodeScale, nodes, steps]
   );
-
-  if (!layout) {
-    return null;
-  }
-
   const nodeById = useMemo(
-    () => new Map(layout.nodes.map((node) => [node.id, node])),
-    [layout.nodes]
+    () => new Map((layout?.nodes ?? []).map((node) => [node.id, node])),
+    [layout]
   );
   const agentNameByLookup = useMemo(() => {
     const lookup = new Map<string, string>();
@@ -397,6 +431,10 @@ export function WorkflowGraphBoard({
   }, [agents]);
   const emphasizedNodeId = hoveredNodeId ?? selectedStepId ?? null;
   const renderedEdges = useMemo<RenderEdge[]>(() => {
+    if (!layout) {
+      return [];
+    }
+
     const groupedEdges = new Map<
       string,
       Array<{ edge: WorkflowGraphEdge; source: LayoutNode; target: LayoutNode }>
@@ -451,13 +489,64 @@ export function WorkflowGraphBoard({
     return next;
   }, [compact, edges, layout, nodeById]);
 
+  if (!layout) {
+    return null;
+  }
+
+  const decreaseNodeScale = () =>
+    setNodeScale((value) => clampNodeScale(value - NODE_SCALE_STEP));
+  const increaseNodeScale = () =>
+    setNodeScale((value) => clampNodeScale(value + NODE_SCALE_STEP));
+  const scaleLabel = `${Math.round(nodeScale * 100)}%`;
+
   return (
     <div
       className={cn(
-        'overflow-auto rounded-[28px] border border-white/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.95)_0%,rgba(241,245,249,0.92)_100%)] p-4 dark:border-[#243041] dark:bg-[linear-gradient(180deg,rgba(15,23,42,0.88)_0%,rgba(11,16,23,0.94)_100%)]',
+        'overflow-auto border border-white/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.95)_0%,rgba(241,245,249,0.92)_100%)] p-4 dark:border-[#243041] dark:bg-[linear-gradient(180deg,rgba(15,23,42,0.88)_0%,rgba(11,16,23,0.94)_100%)]',
+        isFullscreen
+          ? 'fixed inset-3 z-[80] rounded-[28px] shadow-[0_30px_100px_rgba(15,23,42,0.34)] md:inset-6'
+          : 'relative rounded-[28px]',
         className
       )}
     >
+      <div className="sticky left-0 top-0 z-20 mb-3 flex w-fit items-center gap-2 rounded-full border border-[#CBD5E1] bg-white/90 p-1 shadow-sm backdrop-blur dark:border-[#334155] dark:bg-[rgba(15,23,42,0.86)]">
+        <button
+          type="button"
+          onClick={decreaseNodeScale}
+          disabled={nodeScale <= MIN_NODE_SCALE}
+          className="inline-flex size-8 items-center justify-center rounded-full text-[#475569] transition-colors hover:bg-[#F1F5F9] hover:text-[#0F172A] disabled:cursor-not-allowed disabled:text-[#CBD5E1] dark:text-[#CBD5E1] dark:hover:bg-[#1E293B] dark:hover:text-white dark:disabled:text-[#475569]"
+          aria-label="Decrease node size"
+          title="Decrease node size"
+        >
+          <MagnifyingGlassMinusIcon className="size-4" weight="bold" />
+        </button>
+        <div className="min-w-[46px] select-none text-center text-xs font-semibold text-[#334155] dark:text-[#CBD5E1]">
+          {scaleLabel}
+        </div>
+        <button
+          type="button"
+          onClick={increaseNodeScale}
+          disabled={nodeScale >= MAX_NODE_SCALE}
+          className="inline-flex size-8 items-center justify-center rounded-full text-[#475569] transition-colors hover:bg-[#F1F5F9] hover:text-[#0F172A] disabled:cursor-not-allowed disabled:text-[#CBD5E1] dark:text-[#CBD5E1] dark:hover:bg-[#1E293B] dark:hover:text-white dark:disabled:text-[#475569]"
+          aria-label="Increase node size"
+          title="Increase node size"
+        >
+          <MagnifyingGlassPlusIcon className="size-4" weight="bold" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setIsFullscreen((value) => !value)}
+          className="inline-flex size-8 items-center justify-center rounded-full text-[#475569] transition-colors hover:bg-[#F1F5F9] hover:text-[#0F172A] dark:text-[#CBD5E1] dark:hover:bg-[#1E293B] dark:hover:text-white"
+          aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+          title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+        >
+          {isFullscreen ? (
+            <ArrowsInSimpleIcon className="size-4" weight="bold" />
+          ) : (
+            <ArrowsOutSimpleIcon className="size-4" weight="bold" />
+          )}
+        </button>
+      </div>
       <div
         className="relative"
         style={{ width: layout.width, height: layout.height }}
@@ -483,7 +572,7 @@ export function WorkflowGraphBoard({
                       ? 'rgba(37,99,235,0.22)'
                       : 'rgba(148,163,184,0.14)'
                   }
-                  strokeWidth={compact ? 8 : 10}
+                  strokeWidth={(compact ? 8 : 10) * nodeScale}
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 />
@@ -492,7 +581,13 @@ export function WorkflowGraphBoard({
                   fill="none"
                   stroke={isHighlighted ? '#2563EB' : '#94A3B8'}
                   strokeWidth={
-                    isHighlighted ? (compact ? 3 : 3.5) : compact ? 2.25 : 2.75
+                    (isHighlighted
+                      ? compact
+                        ? 3
+                        : 3.5
+                      : compact
+                        ? 2.25
+                        : 2.75) * nodeScale
                   }
                   strokeLinecap="round"
                   strokeLinejoin="round"
@@ -509,7 +604,7 @@ export function WorkflowGraphBoard({
           const canRetryStep =
             !!onRetryStep &&
             !!retryStepId &&
-            (step?.status === 'failed' || step?.status === 'interrupted');
+            isRetryableWorkflowStepStatus(step?.status);
           const isRetryPending =
             !!retryStepId && pendingActionId === retryStepId;
           const tone = statusTone(
@@ -551,9 +646,7 @@ export function WorkflowGraphBoard({
               }
               className={cn(
                 'absolute flex flex-col rounded-[26px] border bg-white/92 text-left transition-all duration-200 hover:-translate-y-0.5 hover:bg-white dark:bg-[rgba(15,23,42,0.92)] dark:hover:bg-[rgba(15,23,42,0.98)]',
-                compact
-                  ? 'h-[104px] w-[184px] p-3'
-                  : 'h-[118px] w-[208px] p-3.5',
+                compact ? 'p-3' : 'p-3.5',
                 onSelectStep && 'cursor-pointer',
                 tone.glow,
                 (node.id === selectedStepId || node.id === hoveredNodeId) &&
@@ -562,6 +655,8 @@ export function WorkflowGraphBoard({
               style={{
                 left: node.x,
                 top: node.y,
+                width: layout.cardWidth,
+                height: layout.cardHeight,
                 borderColor: tone.border,
                 boxShadow: `inset 0 1px 0 rgba(255,255,255,0.7), 0 0 0 1px ${tone.accent}`,
               }}

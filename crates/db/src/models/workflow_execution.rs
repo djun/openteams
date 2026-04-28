@@ -33,6 +33,100 @@ pub struct WorkflowExecution {
     pub updated_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
+mod tests {
+    use sqlx::SqlitePool;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        models::{
+            workflow_plan::{CreateWorkflowPlan, WorkflowPlan},
+            workflow_types::{WorkflowValidationStatus, to_workflow_wire_value},
+        },
+        run_migrations,
+    };
+
+    async fn create_execution_with_status(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        status: WorkflowExecutionStatus,
+    ) -> WorkflowExecution {
+        let plan_id = Uuid::new_v4();
+        WorkflowPlan::create(
+            pool,
+            &CreateWorkflowPlan {
+                session_id,
+                source_message_id: None,
+                created_by_session_agent_id: None,
+                title: format!("Plan {plan_id}"),
+                summary_text: None,
+                plan_json: "{}".to_string(),
+                plan_schema_version: 1,
+                plan_hash: plan_id.to_string(),
+                validation_status: WorkflowValidationStatus::Valid,
+                validation_errors_json: None,
+            },
+            plan_id,
+        )
+        .await
+        .expect("create workflow plan");
+
+        let execution = WorkflowExecution::create(
+            pool,
+            &CreateWorkflowExecution {
+                session_id,
+                plan_id,
+                active_revision_id: None,
+                lead_session_agent_id: None,
+                title: format!("Execution {plan_id}"),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("create workflow execution");
+
+        WorkflowExecution::update_status(pool, execution.id, status)
+            .await
+            .expect("update workflow execution status")
+    }
+
+    #[tokio::test]
+    async fn generation_blocking_query_excludes_terminal_executions() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory pool");
+        run_migrations(&pool).await.expect("run migrations");
+
+        let session_id = Uuid::new_v4();
+        for status in [
+            WorkflowExecutionStatus::Pending,
+            WorkflowExecutionStatus::Running,
+            WorkflowExecutionStatus::Waiting,
+            WorkflowExecutionStatus::Paused,
+            WorkflowExecutionStatus::Recompiling,
+            WorkflowExecutionStatus::Completed,
+            WorkflowExecutionStatus::Failed,
+        ] {
+            create_execution_with_status(&pool, session_id, status).await;
+        }
+
+        let blocking = WorkflowExecution::find_generation_blocking_by_session(&pool, session_id)
+            .await
+            .expect("query blocking executions");
+        let mut blocking_statuses = blocking
+            .iter()
+            .map(|execution| to_workflow_wire_value(&execution.status))
+            .collect::<Vec<_>>();
+        blocking_statuses.sort();
+
+        assert_eq!(
+            blocking_statuses,
+            vec!["paused", "pending", "recompiling", "running", "waiting"]
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateWorkflowExecution {
     pub session_id: Uuid,
@@ -66,8 +160,15 @@ impl WorkflowExecution {
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<Self>, sqlx::Error> {
+        Self::find_generation_blocking_by_session(pool, session_id).await
+    }
+
+    pub async fn find_generation_blocking_by_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Vec<Self>, sqlx::Error> {
         sqlx::query_as::<_, Self>(&format!(
-            "{EXECUTION_SELECT}\nWHERE session_id = ?1 AND status IN ('running', 'completed')\nORDER BY created_at DESC"
+            "{EXECUTION_SELECT}\nWHERE session_id = ?1 AND status IN ('pending', 'running', 'waiting', 'paused', 'recompiling')\nORDER BY created_at DESC"
         ))
         .bind(session_id)
         .fetch_all(pool)
@@ -78,12 +179,7 @@ impl WorkflowExecution {
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        sqlx::query_as::<_, Self>(&format!(
-            "{EXECUTION_SELECT}\nWHERE session_id = ?1 AND status NOT IN ('completed', 'failed')\nORDER BY created_at DESC"
-        ))
-        .bind(session_id)
-        .fetch_all(pool)
-        .await
+        Self::find_generation_blocking_by_session(pool, session_id).await
     }
 
     pub async fn create(
@@ -133,6 +229,30 @@ impl WorkflowExecution {
         .bind(id)
         .bind(status)
         .fetch_one(pool)
+        .await
+    }
+
+    pub async fn update_status_if_current(
+        pool: &SqlitePool,
+        id: Uuid,
+        expected_status: WorkflowExecutionStatus,
+        status: WorkflowExecutionStatus,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        sqlx::query_as::<_, Self>(
+            r#"
+            UPDATE chat_workflow_executions
+            SET status = ?3, updated_at = datetime('now', 'subsec')
+            WHERE id = ?1 AND status = ?2
+            RETURNING id, session_id, plan_id, active_revision_id, active_round_id,
+                      workflow_card_message_id, lead_session_agent_id, status,
+                      current_round, title, compiled_graph_hash,
+                      started_at, completed_at, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(expected_status)
+        .bind(status)
+        .fetch_optional(pool)
         .await
     }
 

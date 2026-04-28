@@ -18,7 +18,7 @@ use db::{
         workflow_transcript::{CreateWorkflowTranscript, WorkflowTranscript},
         workflow_types::{
             WorkflowExecutionStatus, WorkflowPlanJson, WorkflowPlanNode, WorkflowStepStatus,
-            WorkflowStepType,
+            WorkflowStepType, to_workflow_wire_value,
         },
     },
 };
@@ -29,7 +29,10 @@ use executors::{
         BaseCodingAgent, ExecutorError, ExecutorExitResult, SpawnedChild,
         StandardCodingAgentExecutor,
     },
-    logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
+    logs::{
+        ActionType, FileChange, NormalizedEntry, NormalizedEntryType, ToolResult, ToolStatus,
+        utils::patch::extract_normalized_entry_from_patch,
+    },
     model_sync::with_model,
     profile::{ExecutorConfigs, ExecutorProfileId, canonical_variant_key},
 };
@@ -212,29 +215,43 @@ struct WorkflowRuntimeStreamState {
     error_buffer: String,
 }
 
+struct WorkflowRuntimeEntryLine {
+    stream_type: ChatStreamDeltaType,
+    content: String,
+    immediate: bool,
+}
+
 impl WorkflowRuntimeStreamState {
     fn drain_patch_lines(&mut self, patch: &Patch) -> Vec<(ChatStreamDeltaType, String)> {
         let Some((index, entry)) = extract_normalized_entry_from_patch(patch) else {
             return Vec::new();
         };
 
-        let Some(stream_type) = workflow_stream_type_for_entry(&entry.entry_type) else {
+        let Some(line) = workflow_runtime_line_for_entry(&entry) else {
             return Vec::new();
         };
 
         let previous = self
             .last_content_by_index
-            .insert(index, entry.content.clone())
+            .insert(index, line.content.clone())
             .unwrap_or_default();
-        let chunk = if entry.content.starts_with(&previous) {
-            entry.content[previous.len()..].to_string()
-        } else if previous == entry.content {
+        if previous == line.content {
+            return Vec::new();
+        }
+
+        if line.immediate {
+            return vec![(line.stream_type, line.content)];
+        }
+
+        let chunk = if line.content.starts_with(&previous) {
+            line.content[previous.len()..].to_string()
+        } else if previous == line.content {
             String::new()
         } else {
-            entry.content
+            line.content
         };
 
-        self.drain_chunk_lines(stream_type, &chunk)
+        self.drain_chunk_lines(line.stream_type, &chunk)
     }
 
     fn drain_chunk_lines(
@@ -285,10 +302,207 @@ impl WorkflowRuntimeStreamState {
     }
 }
 
-fn workflow_stream_type_for_entry(entry_type: &NormalizedEntryType) -> Option<ChatStreamDeltaType> {
-    match entry_type {
-        NormalizedEntryType::Thinking => Some(ChatStreamDeltaType::Thinking),
+fn workflow_runtime_line_for_entry(entry: &NormalizedEntry) -> Option<WorkflowRuntimeEntryLine> {
+    match &entry.entry_type {
+        NormalizedEntryType::Thinking => Some(WorkflowRuntimeEntryLine {
+            stream_type: ChatStreamDeltaType::Thinking,
+            content: entry.content.clone(),
+            immediate: false,
+        }),
+        NormalizedEntryType::ToolUse {
+            tool_name,
+            action_type,
+            status,
+        } => workflow_tool_activity_content(tool_name, action_type, status, &entry.content).map(
+            |content| WorkflowRuntimeEntryLine {
+                stream_type: ChatStreamDeltaType::Thinking,
+                content,
+                immediate: true,
+            },
+        ),
+        // AssistantMessage remains reserved for the final workflow protocol
+        // payload, so streaming it into transcript would duplicate or expose
+        // the final_result JSON before the orchestrator handles it.
         _ => None,
+    }
+}
+
+fn workflow_tool_activity_content(
+    tool_name: &str,
+    action_type: &ActionType,
+    status: &ToolStatus,
+    fallback_content: &str,
+) -> Option<String> {
+    let status_label = workflow_tool_status_label(status);
+
+    let content = match action_type {
+        ActionType::FileEdit { path, changes } => {
+            let change_summary = workflow_file_change_summary(changes);
+            format!("{status_label} file edit: {path}{change_summary}")
+        }
+        ActionType::CommandRun { command, .. } => {
+            format!(
+                "{status_label} command: {}",
+                truncate_workflow_runtime_line(command)
+            )
+        }
+        ActionType::Tool {
+            tool_name: inner_tool_name,
+            result,
+            ..
+        } => {
+            let display_tool_name = if inner_tool_name.trim().is_empty() {
+                tool_name
+            } else {
+                inner_tool_name
+            };
+            let prefix = if tool_name.starts_with("mcp:") || display_tool_name.starts_with("mcp:") {
+                "MCP tool"
+            } else {
+                "Tool"
+            };
+            let mut line = format!("{status_label} {prefix}: {display_tool_name}");
+            if let Some(preview) = workflow_tool_result_preview(result) {
+                line.push_str(": ");
+                line.push_str(&preview);
+            }
+            line
+        }
+        ActionType::TaskCreate {
+            description,
+            subagent_type,
+            result,
+        } => {
+            let mut line = format!(
+                "{status_label} task: {}",
+                truncate_workflow_runtime_line(description)
+            );
+            if let Some(subagent_type) = subagent_type
+                && !subagent_type.trim().is_empty()
+            {
+                line.push_str(" (");
+                line.push_str(subagent_type.trim());
+                line.push(')');
+            }
+            if let Some(preview) = workflow_tool_result_preview(result) {
+                line.push_str(": ");
+                line.push_str(&preview);
+            }
+            line
+        }
+        ActionType::FileRead { path } => format!("{status_label} file read: {path}"),
+        ActionType::Search { query } => {
+            format!(
+                "{status_label} search: {}",
+                truncate_workflow_runtime_line(query)
+            )
+        }
+        ActionType::WebFetch { url } => format!("{status_label} web fetch: {url}"),
+        ActionType::TodoManagement { todos, operation } => {
+            format!("{status_label} plan {operation}: {} item(s)", todos.len())
+        }
+        ActionType::PlanPresentation { plan } => {
+            format!(
+                "{status_label} plan: {}",
+                truncate_workflow_runtime_line(plan)
+            )
+        }
+        ActionType::Other { description } => {
+            format!(
+                "{status_label} activity: {}",
+                truncate_workflow_runtime_line(description)
+            )
+        }
+    };
+
+    let content = content.trim();
+    if !content.is_empty() {
+        return Some(content.to_string());
+    }
+
+    let fallback = fallback_content.trim();
+    (!fallback.is_empty()).then(|| {
+        format!(
+            "{status_label} activity: {}",
+            truncate_workflow_runtime_line(fallback)
+        )
+    })
+}
+
+fn workflow_tool_status_label(status: &ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Created => "Started",
+        ToolStatus::Success => "Completed",
+        ToolStatus::Failed => "Failed",
+        ToolStatus::Denied { .. } => "Denied",
+        ToolStatus::PendingApproval { .. } => "Waiting approval for",
+        ToolStatus::TimedOut => "Timed out",
+    }
+}
+
+fn workflow_file_change_summary(changes: &[FileChange]) -> String {
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    let mut write_count = 0;
+    let mut edit_count = 0;
+    let mut delete_count = 0;
+    let mut rename_count = 0;
+
+    for change in changes {
+        match change {
+            FileChange::Write { .. } => write_count += 1,
+            FileChange::Edit { .. } => edit_count += 1,
+            FileChange::Delete => delete_count += 1,
+            FileChange::Rename { .. } => rename_count += 1,
+        }
+    }
+
+    let mut parts = Vec::new();
+    if write_count > 0 {
+        parts.push(format!("{write_count} write"));
+    }
+    if edit_count > 0 {
+        parts.push(format!("{edit_count} edit"));
+    }
+    if delete_count > 0 {
+        parts.push(format!("{delete_count} delete"));
+    }
+    if rename_count > 0 {
+        parts.push(format!("{rename_count} rename"));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+fn workflow_tool_result_preview(result: &Option<ToolResult>) -> Option<String> {
+    let result = result.as_ref()?;
+    let preview = match &result.value {
+        serde_json::Value::String(value) => value.clone(),
+        value => value.to_string(),
+    };
+    let preview = preview
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(truncate_workflow_runtime_line(preview))
+}
+
+fn truncate_workflow_runtime_line(value: &str) -> String {
+    const MAX_LEN: usize = 220;
+
+    let trimmed = value.trim();
+    let mut chars = trimmed.chars();
+    let truncated = chars.by_ref().take(MAX_LEN).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -561,7 +775,7 @@ pub fn build_step_execution_prompt(
     workflow_goal: &str,
     step: &WorkflowStep,
     completed_dependency_summaries: &[String],
-    step_transcript_context: Option<&str>,
+    _step_transcript_context: Option<&str>,
 ) -> String {
     let dependency_text = if completed_dependency_summaries.is_empty() {
         "无".to_string()
@@ -573,10 +787,6 @@ pub fn build_step_execution_prompt(
     } else {
         dependency_text
     };
-    let step_transcript_text = step_transcript_context
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("无");
 
     return format!(
         r#"你正在执行 OpenTeams workflow mode 中的一个 step。
@@ -649,8 +859,6 @@ step 指令：{step_instructions}
 已完成前置步骤摘要：
 {dependency_text}
 
-当前 step 已有交互记录：
-{step_transcript_text}
 "#,
         step_key = step.step_key,
         execution_id = execution.id,
@@ -812,8 +1020,8 @@ pub fn build_workflow_card_projection(
             id: step.id.to_string(),
             step_key: step.step_key.clone(),
             title: step.title.clone(),
-            step_type: format!("{:?}", step.step_type).to_lowercase(),
-            status: format!("{:?}", step.status).to_lowercase(),
+            step_type: to_workflow_wire_value(&step.step_type),
+            status: to_workflow_wire_value(&step.status),
             agent_name: step
                 .assigned_workflow_agent_session_id
                 .and_then(|id| workflow_agent_name_by_id.get(&id))
@@ -862,7 +1070,7 @@ pub fn build_workflow_card_projection(
         WorkflowExecutionStatus::Failed => WorkflowCardState::Failed,
         WorkflowExecutionStatus::Paused => WorkflowCardState::Paused,
         WorkflowExecutionStatus::Waiting => WorkflowCardState::Waiting,
-        WorkflowExecutionStatus::Recompiling => WorkflowCardState::Paused,
+        WorkflowExecutionStatus::Recompiling => WorkflowCardState::Running,
         _ => WorkflowCardState::Running,
     };
 
@@ -877,7 +1085,7 @@ pub fn build_workflow_card_projection(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| plan.title.clone()),
         state,
-        execution_status: format!("{:?}", execution.status).to_lowercase(),
+        execution_status: to_workflow_wire_value(&execution.status),
         error_message,
         completed_step_count,
         total_step_count,
@@ -1395,7 +1603,7 @@ pub fn overlay_step_statuses(
         .cloned()
         .map(|mut node| {
             if let Some(step) = step_by_key.get(node.id.as_str()) {
-                node.data.status = Some(format!("{:?}", step.status).to_lowercase());
+                node.data.status = Some(to_workflow_wire_value(&step.status));
             }
             node
         })
@@ -1599,7 +1807,162 @@ fn extract_latest_assistant_from_history(history: &[LogMsg]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use db::models::{
+        chat_agent::ChatAgent,
+        chat_session_agent::{ChatSessionAgent, ChatSessionAgentState},
+        workflow_plan::WorkflowPlan,
+        workflow_plan_revision::WorkflowPlanRevision,
+        workflow_types::{
+            WorkflowPlanStatus, WorkflowRevisionEditor, WorkflowValidationStatus,
+            to_workflow_wire_value,
+        },
+    };
+    use sqlx::types::Json;
+
     use super::*;
+
+    fn sample_plan_json() -> String {
+        serde_json::json!({
+            "version": "1",
+            "title": "Projection Contract",
+            "goal": "Verify projection statuses",
+            "agents": {
+                "lead": "agent-1",
+                "available": ["agent-1"]
+            },
+            "nodes": [
+                {
+                    "id": "step-1",
+                    "type": "workflowStep",
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "data": {
+                        "stepType": "task",
+                        "agentId": "agent-1",
+                        "title": "Step 1",
+                        "instructions": "Run step 1"
+                    }
+                }
+            ],
+            "edges": []
+        })
+        .to_string()
+    }
+
+    fn sample_execution(status: WorkflowExecutionStatus) -> WorkflowExecution {
+        let now = Utc::now();
+        WorkflowExecution {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            plan_id: Uuid::new_v4(),
+            active_revision_id: Some(Uuid::new_v4()),
+            active_round_id: Some(Uuid::new_v4()),
+            workflow_card_message_id: None,
+            lead_session_agent_id: None,
+            status,
+            current_round: 1,
+            title: "Projection Contract".to_string(),
+            compiled_graph_hash: Some("hash".to_string()),
+            started_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn sample_plan(plan_id: Uuid) -> WorkflowPlan {
+        let now = Utc::now();
+        WorkflowPlan {
+            id: plan_id,
+            session_id: Uuid::new_v4(),
+            source_message_id: None,
+            created_by_session_agent_id: None,
+            status: WorkflowPlanStatus::Ready,
+            title: "Projection Contract".to_string(),
+            summary_text: Some("Verify projection statuses".to_string()),
+            plan_json: sample_plan_json(),
+            plan_schema_version: 1,
+            plan_hash: "hash".to_string(),
+            validation_status: WorkflowValidationStatus::Valid,
+            validation_errors_json: None,
+            workflow_card_message_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn sample_revision(plan_id: Uuid, plan_json: String) -> WorkflowPlanRevision {
+        WorkflowPlanRevision {
+            id: Uuid::new_v4(),
+            plan_id,
+            revision_no: 1,
+            edited_by: WorkflowRevisionEditor::Lead,
+            editor_session_agent_id: None,
+            reason: None,
+            plan_json,
+            plan_hash: "hash".to_string(),
+            validation_status: WorkflowValidationStatus::Valid,
+            validation_errors_json: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn sample_step(status: WorkflowStepStatus) -> WorkflowStep {
+        let now = Utc::now();
+        WorkflowStep {
+            id: Uuid::new_v4(),
+            execution_id: Uuid::new_v4(),
+            round_id: Uuid::new_v4(),
+            compiled_revision_id: None,
+            step_key: "step-1".to_string(),
+            step_type: WorkflowStepType::Task,
+            title: "Step 1".to_string(),
+            instructions: "Run step 1".to_string(),
+            assigned_workflow_agent_session_id: None,
+            status,
+            retry_count: 0,
+            max_retry: 1,
+            round_index: 1,
+            display_order: 0,
+            latest_run_id: None,
+            summary_text: None,
+            content: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    fn sample_agent_views() -> (Vec<ChatSessionAgent>, Vec<ChatAgent>) {
+        let now = Utc::now();
+        let agent_id = Uuid::new_v4();
+        let session_agent = ChatSessionAgent {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            agent_id,
+            state: ChatSessionAgentState::Idle,
+            workspace_path: None,
+            pty_session_key: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            allowed_skill_ids: Json(Vec::new()),
+            created_at: now,
+            updated_at: now,
+        };
+        let agent = ChatAgent {
+            id: agent_id,
+            name: "Agent 1".to_string(),
+            runner_type: "codex".to_string(),
+            system_prompt: String::new(),
+            tools_enabled: Json(serde_json::json!({})),
+            model_name: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        (vec![session_agent], vec![agent])
+    }
 
     #[test]
     fn build_plan_generation_prompt_includes_previous_failure_reason() {
@@ -1717,5 +2080,176 @@ mod tests {
             parse_step_protocol_output(execution_id, "review", &raw_output).expect_err("invalid");
 
         assert!(matches!(err, WorkflowRuntimeError::Validation(_)));
+    }
+
+    #[test]
+    fn workflow_runtime_line_keeps_assistant_for_final_protocol_only() {
+        let entry = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::AssistantMessage,
+            content: r#"{"type":"final_result","summary":"done"}"#.to_string(),
+            metadata: None,
+        };
+
+        assert!(workflow_runtime_line_for_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn workflow_runtime_line_maps_reasoning_to_thinking() {
+        let entry = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::Thinking,
+            content: "Checking the workflow state machine".to_string(),
+            metadata: None,
+        };
+
+        let line = workflow_runtime_line_for_entry(&entry).expect("thinking line");
+
+        assert!(matches!(line.stream_type, ChatStreamDeltaType::Thinking));
+        assert_eq!(line.content, "Checking the workflow state machine");
+        assert!(!line.immediate);
+    }
+
+    #[test]
+    fn workflow_runtime_line_maps_file_edit_activity_to_thinking() {
+        let entry = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::ToolUse {
+                tool_name: "edit".to_string(),
+                action_type: ActionType::FileEdit {
+                    path: "frontend/src/pages/ui-new/chat/components/WorkflowWindow.tsx"
+                        .to_string(),
+                    changes: vec![FileChange::Edit {
+                        unified_diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                        has_line_numbers: true,
+                    }],
+                },
+                status: ToolStatus::Created,
+            },
+            content: "WorkflowWindow.tsx".to_string(),
+            metadata: None,
+        };
+
+        let line = workflow_runtime_line_for_entry(&entry).expect("file edit line");
+
+        assert!(matches!(line.stream_type, ChatStreamDeltaType::Thinking));
+        assert!(line.immediate);
+        assert!(line.content.contains("Started file edit"));
+        assert!(line.content.contains("WorkflowWindow.tsx"));
+        assert!(line.content.contains("1 edit"));
+    }
+
+    #[test]
+    fn workflow_runtime_line_maps_mcp_progress_to_thinking_preview() {
+        let entry = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::ToolUse {
+                tool_name: "mcp:github:search_issues".to_string(),
+                action_type: ActionType::Tool {
+                    tool_name: "github.search_issues".to_string(),
+                    arguments: None,
+                    result: Some(ToolResult::markdown(
+                        "Fetched 3 matching issues\nmore detail",
+                    )),
+                },
+                status: ToolStatus::Created,
+            },
+            content: "search_issues".to_string(),
+            metadata: None,
+        };
+
+        let line = workflow_runtime_line_for_entry(&entry).expect("mcp progress line");
+
+        assert!(matches!(line.stream_type, ChatStreamDeltaType::Thinking));
+        assert!(line.immediate);
+        assert_eq!(
+            line.content,
+            "Started MCP tool: github.search_issues: Fetched 3 matching issues"
+        );
+    }
+
+    #[test]
+    fn workflow_projection_uses_canonical_wire_statuses() {
+        let plan_json = sample_plan_json();
+        let mut expected_step_statuses = [
+            WorkflowStepStatus::Pending,
+            WorkflowStepStatus::Ready,
+            WorkflowStepStatus::Running,
+            WorkflowStepStatus::InterruptRequested,
+            WorkflowStepStatus::Interrupted,
+            WorkflowStepStatus::WaitingInput,
+            WorkflowStepStatus::WaitingReview,
+            WorkflowStepStatus::Blocked,
+            WorkflowStepStatus::Completed,
+            WorkflowStepStatus::Failed,
+            WorkflowStepStatus::Skipped,
+            WorkflowStepStatus::Cancelled,
+        ]
+        .into_iter()
+        .map(|status| {
+            let execution = sample_execution(WorkflowExecutionStatus::Running);
+            let plan = sample_plan(execution.plan_id);
+            let revision = sample_revision(plan.id, plan_json.clone());
+            let (session_agents, agents) = sample_agent_views();
+            let projection = build_workflow_card_projection(
+                &execution,
+                &plan,
+                &revision,
+                &[sample_step(status.clone())],
+                &[],
+                &[],
+                &session_agents,
+                &agents,
+                None,
+            )
+            .expect("build projection");
+
+            let expected_status = to_workflow_wire_value(&status);
+            assert_eq!(projection.steps[0].status, expected_status);
+            assert_eq!(
+                projection.plan.nodes[0].data.status.as_deref(),
+                Some(expected_status.as_str())
+            );
+
+            projection.steps[0].status.clone()
+        })
+        .collect::<Vec<_>>();
+        expected_step_statuses.sort();
+
+        assert!(expected_step_statuses.contains(&"waiting_input".to_string()));
+        assert!(expected_step_statuses.contains(&"waiting_review".to_string()));
+        assert!(expected_step_statuses.contains(&"interrupt_requested".to_string()));
+
+        for status in [
+            WorkflowExecutionStatus::Pending,
+            WorkflowExecutionStatus::Running,
+            WorkflowExecutionStatus::Failed,
+            WorkflowExecutionStatus::Paused,
+            WorkflowExecutionStatus::Recompiling,
+            WorkflowExecutionStatus::Completed,
+            WorkflowExecutionStatus::Waiting,
+        ] {
+            let execution = sample_execution(status.clone());
+            let plan = sample_plan(execution.plan_id);
+            let revision = sample_revision(plan.id, plan_json.clone());
+            let (session_agents, agents) = sample_agent_views();
+            let projection = build_workflow_card_projection(
+                &execution,
+                &plan,
+                &revision,
+                &[sample_step(WorkflowStepStatus::Completed)],
+                &[],
+                &[],
+                &session_agents,
+                &agents,
+                None,
+            )
+            .expect("build projection");
+
+            assert_eq!(projection.execution_status, to_workflow_wire_value(&status));
+            if matches!(status, WorkflowExecutionStatus::Recompiling) {
+                assert!(matches!(projection.state, WorkflowCardState::Running));
+            }
+        }
     }
 }

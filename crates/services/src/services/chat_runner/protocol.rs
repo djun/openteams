@@ -979,7 +979,7 @@ impl ChatRunner {
             )
             .await?;
 
-        if !WorkflowExecution::find_active_by_session(pool, session_id)
+        if !WorkflowExecution::find_generation_blocking_by_session(pool, session_id)
             .await
             .unwrap_or_default()
             .is_empty()

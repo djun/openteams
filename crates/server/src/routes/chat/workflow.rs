@@ -62,7 +62,7 @@ pub async fn generate_plan_and_run(
 ) -> Result<Response, ApiError> {
     let pool = &deployment.db().pool;
 
-    if !WorkflowExecution::find_non_terminal_by_session(pool, session.id)
+    if !WorkflowExecution::find_generation_blocking_by_session(pool, session.id)
         .await?
         .is_empty()
     {

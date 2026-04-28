@@ -701,7 +701,9 @@ export function useChatWebSocket(
     async (sessionId: string) => {
       if (!sessionId) return;
       queryClient.invalidateQueries({ queryKey: ['chatMessages', sessionId] });
-      queryClient.invalidateQueries({ queryKey: ['workflowTranscripts', sessionId] });
+      queryClient.invalidateQueries({
+        queryKey: ['workflowTranscripts', sessionId],
+      });
       queryClient.invalidateQueries({
         queryKey: ['workflowStepTranscripts', sessionId],
       });

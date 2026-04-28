@@ -18,6 +18,12 @@ import {
   parseWorkflowTranscriptMeta,
   toWorkflowFinalReviewAction,
 } from './WorkflowFinalReviewCard';
+import {
+  canPauseWorkflowExecution,
+  canResumeWorkflowExecution,
+  isRetryableWorkflowStepStatus,
+  isWorkflowExecutionRecompiling,
+} from './workflowControlContract';
 
 type WorkflowCardStep = {
   id: string;
@@ -713,6 +719,8 @@ function workflowStatusBadgeClass(status?: string | null) {
     case 'failed':
     case 'interrupted':
       return 'border-[#FCA5A5] bg-[#FEE2E2] text-[#991B1B]';
+    case 'interrupt_requested':
+      return 'border-[#FCD34D] bg-[#FEF3C7] text-[#92400E]';
     case 'ready':
       return 'border-[#FCD34D] bg-[#FEF3C7] text-[#92400E]';
     case 'waiting_input':
@@ -1052,7 +1060,9 @@ export function WorkflowWindow({
   const isPreview =
     projection.state === 'preview_ready' ||
     projection.state === 'preview_invalid';
-  const isRunning = projection.execution_status === 'running';
+  const canPauseExecution = canPauseWorkflowExecution(projection);
+  const canResumeExecution = canResumeWorkflowExecution(projection);
+  const isExecutionRecompiling = isWorkflowExecutionRecompiling(projection);
   const normalizedResultSummary = projection.result_summary?.trim() ?? '';
   const normalizedErrorMessage = projection.error_message?.trim() ?? '';
   const hasFailedWorkflowStep = projection.steps.some((step) =>
@@ -1073,11 +1083,6 @@ export function WorkflowWindow({
     projection.state === 'failed' ||
     projection.execution_status === 'failed' ||
     (normalizedErrorMessage.length > 0 && hasFailedWorkflowStep);
-  const canResume =
-    projection.execution_status === 'paused' ||
-    projection.execution_status === 'failed' ||
-    projection.state === 'paused';
-
   const agents = useMemo(() => projection.agents ?? [], [projection.agents]);
   const leadAgentId =
     agents[0]?.workflow_agent_session_id ?? agents[0]?.session_agent_id ?? null;
@@ -1530,8 +1535,6 @@ export function WorkflowWindow({
   }, [
     detailAgentSessionId,
     detailStep,
-    detailStep?.id,
-    detailStep?.step_key,
     detailStepTranscriptData,
     resolveStepAgentId,
     transcriptWithLocalInputs,
@@ -1703,6 +1706,11 @@ export function WorkflowWindow({
                       {normalizedResultSummary}
                     </span>
                   )}
+                  {isExecutionRecompiling && (
+                    <span className="rounded-[10px] border border-[#14B8A6] px-2.5 py-1 font-semibold text-[#0F766E] dark:border-[#2DD4BF] dark:text-[#99F6E4]">
+                      Recompiling plan
+                    </span>
+                  )}
                   {hasWorkflowFailed && normalizedErrorMessage && (
                     <span className="select-text rounded-[10px] border border-[#DC2626] px-2.5 py-1 font-semibold text-[#991B1B] dark:border-[#F87171] dark:text-[#FECACA]">
                       {normalizedErrorMessage}
@@ -1723,7 +1731,7 @@ export function WorkflowWindow({
                       Execute Plan
                     </button>
                   )}
-                {isRunning && projection.execution_id && onPauseAll && (
+                {canPauseExecution && projection.execution_id && onPauseAll && (
                   <button
                     type="button"
                     onClick={() => onPauseAll(projection.execution_id!)}
@@ -1733,7 +1741,7 @@ export function WorkflowWindow({
                     Pause All
                   </button>
                 )}
-                {canResume && projection.execution_id && onResume && (
+                {canResumeExecution && projection.execution_id && onResume && (
                   <button
                     type="button"
                     onClick={() => onResume(projection.execution_id!)}
@@ -1857,7 +1865,7 @@ export function WorkflowWindow({
                       entries={selectedRuntimeTranscript}
                       isLoading={false}
                       emptyMessage={
-                        isRunning
+                        canPauseExecution
                           ? 'Execution has not produced runtime messages yet.'
                           : 'No runtime messages for this agent yet.'
                       }
@@ -1960,8 +1968,7 @@ export function WorkflowWindow({
                           Terminate
                         </button>
                       )}
-                    {(detailStep.status === 'failed' ||
-                      detailStep.status === 'interrupted') &&
+                    {isRetryableWorkflowStepStatus(detailStep.status) &&
                       onRetryStep && (
                         <button
                           type="button"

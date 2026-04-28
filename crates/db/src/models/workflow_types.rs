@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::Type;
 use ts_rs::TS;
@@ -40,6 +42,16 @@ where
     }
 
     deserializer.deserialize_any(VersionVisitor)
+}
+
+pub fn to_workflow_wire_value<T>(value: &T) -> String
+where
+    T: Serialize + Debug,
+{
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{value:?}").to_lowercase())
 }
 
 // ---------------------------------------------------------------------------

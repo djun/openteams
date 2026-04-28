@@ -14,6 +14,11 @@ import {
   type WorkflowFinalReviewActionData,
   WorkflowFinalReviewCard,
 } from './WorkflowFinalReviewCard';
+import {
+  canPauseWorkflowExecution,
+  canResumeWorkflowExecution,
+  isWorkflowExecutionRecompiling,
+} from './workflowControlContract';
 
 type WorkflowCardNode = {
   id: string;
@@ -204,6 +209,9 @@ export function ChatWorkflowCard({
     projection.state === 'preview_ready' ||
     projection.state === 'preview_invalid';
   const isInvalid = projection.state === 'preview_invalid';
+  const isExecutionRecompiling = isWorkflowExecutionRecompiling(projection);
+  const canPauseExecution = canPauseWorkflowExecution(projection);
+  const canResumeExecution = canResumeWorkflowExecution(projection);
   const showRetryPlanGenerationButton =
     isPlanGenerationFailed &&
     generationMeta?.retryable !== false &&
@@ -213,6 +221,8 @@ export function ChatWorkflowCard({
     <WarningCircleIcon className="size-icon-sm text-[#DC2626]" weight="fill" />
   ) : isPlanGenerationPending ? (
     <ClockIcon className="size-icon-sm text-[#2563EB]" weight="fill" />
+  ) : isExecutionRecompiling ? (
+    <ClockIcon className="size-icon-sm text-[#0F766E]" weight="fill" />
   ) : projection.state === 'completed' ? (
     <CheckCircleIcon className="size-icon-sm text-[#15803D]" weight="fill" />
   ) : projection.state === 'failed' || isInvalid ? (
@@ -231,21 +241,23 @@ export function ChatWorkflowCard({
     ? 'Plan Generation Failed'
     : isPlanGenerationPending
       ? 'Generating Plan'
-      : projection.state === 'completed'
-        ? 'Work Item'
-        : projection.state === 'failed'
-          ? 'Execution Failed'
-          : projection.state === 'preview_ready'
-            ? 'Plan Ready'
-            : projection.state === 'preview_invalid'
-              ? 'Plan Invalid'
-              : projection.state === 'waiting'
-                ? 'Action Required'
-                : projection.state === 'paused'
-                  ? 'Paused'
-                  : projection.state === 'pending'
-                    ? 'Preparing'
-                    : 'Workflow Running';
+      : isExecutionRecompiling
+        ? 'Recompiling Plan'
+        : projection.state === 'completed'
+          ? 'Work Item'
+          : projection.state === 'failed'
+            ? 'Execution Failed'
+            : projection.state === 'preview_ready'
+              ? 'Plan Ready'
+              : projection.state === 'preview_invalid'
+                ? 'Plan Invalid'
+                : projection.state === 'waiting'
+                  ? 'Action Required'
+                  : projection.state === 'paused'
+                    ? 'Paused'
+                    : projection.state === 'pending'
+                      ? 'Preparing'
+                      : 'Workflow Running';
 
   return (
     <div className="w-full max-w-[760px] rounded-[28px] border border-[#D8E2F0] bg-white p-4 shadow-sm">
@@ -370,30 +382,26 @@ export function ChatWorkflowCard({
               Execute Plan
             </button>
           )}
-        {projection.state === 'running' &&
-          projection.execution_id &&
-          onPauseAll && (
-            <button
-              type="button"
-              onClick={() => onPauseAll(projection.execution_id!)}
-              className="flex items-center gap-2 rounded-full bg-[#D97706] px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#B45309]"
-            >
-              <PauseIcon className="size-4" weight="bold" />
-              Pause All
-            </button>
-          )}
-        {(projection.state === 'paused' || projection.state === 'failed') &&
-          projection.execution_id &&
-          onResume && (
-            <button
-              type="button"
-              onClick={() => onResume(projection.execution_id!)}
-              className="flex items-center gap-2 rounded-full bg-[#2563EB] px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#1D4ED8]"
-            >
-              <PlayIcon className="size-4" weight="bold" />
-              Resume
-            </button>
-          )}
+        {canPauseExecution && projection.execution_id && onPauseAll && (
+          <button
+            type="button"
+            onClick={() => onPauseAll(projection.execution_id!)}
+            className="flex items-center gap-2 rounded-full bg-[#D97706] px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#B45309]"
+          >
+            <PauseIcon className="size-4" weight="bold" />
+            Pause All
+          </button>
+        )}
+        {canResumeExecution && projection.execution_id && onResume && (
+          <button
+            type="button"
+            onClick={() => onResume(projection.execution_id!)}
+            className="flex items-center gap-2 rounded-full bg-[#2563EB] px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#1D4ED8]"
+          >
+            <PlayIcon className="size-4" weight="bold" />
+            Resume
+          </button>
+        )}
         {showRetryPlanGenerationButton && (
           <button
             type="button"
