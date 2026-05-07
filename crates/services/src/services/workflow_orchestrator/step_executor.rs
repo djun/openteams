@@ -25,11 +25,14 @@ use super::{
     super::{
         chat_runner::ChatRunner,
         workflow_runtime::{
-            self, SummaryPayload, WorkflowReviewProtocolMessage, WorkflowRevisionFeedbackSource,
-            WorkflowRuntimeError, WorkflowStepProtocolMessage, WorkflowStepRunResult,
-            build_lead_review_prompt, build_step_execution_prompt, build_step_revision_prompt,
+            self, SummaryPayload, WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES,
+            WorkflowReviewProtocolMessage, WorkflowRevisionFeedbackSource, WorkflowRuntimeError,
+            WorkflowStepProtocolMessage, WorkflowStepRunResult,
+            build_lead_review_prompt_with_schema, build_step_execution_prompt_with_schema,
+            build_step_revision_prompt_with_schema, build_workflow_protocol_retry_prompt,
             parse_review_protocol_output, predecessor_summaries, run_workflow_step_agent_follow_up,
-            run_workflow_step_agent_prompt,
+            run_workflow_step_agent_prompt, should_retry_workflow_protocol_parse_failure,
+            workflow_review_protocol_json_schema, workflow_step_protocol_json_schema,
         },
     },
     OrchestratorError, StepOutcome, WorkflowOrchestrator, resolve_step_workflow_session,
@@ -73,6 +76,179 @@ impl WorkflowOrchestrator {
 
         workflow_runtime::parse_step_protocol_output(execution_id, &step.step_key, raw_output)
             .map_err(OrchestratorError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_step_agent_protocol_with_retry(
+        db: &DBService,
+        pool: &SqlitePool,
+        chat_runner: &ChatRunner,
+        session: &ChatSession,
+        agent: &ChatAgent,
+        session_agent: &ChatSessionAgent,
+        workflow_session: &WorkflowAgentSession,
+        prompt: &str,
+        step: &WorkflowStep,
+        first_run_is_follow_up: bool,
+    ) -> Result<(WorkflowStepProtocolMessage, String), OrchestratorError> {
+        let mut attempt = 0;
+        let mut run_as_follow_up = first_run_is_follow_up;
+        let mut prompt_to_send = prompt.to_string();
+
+        loop {
+            let active_workflow_session = if run_as_follow_up {
+                WorkflowAgentSession::find_by_id(pool, workflow_session.id)
+                    .await?
+                    .ok_or_else(|| {
+                        OrchestratorError::NotFound(format!(
+                            "workflow session {} not found",
+                            workflow_session.id
+                        ))
+                    })?
+            } else {
+                workflow_session.clone()
+            };
+
+            let raw_output = if run_as_follow_up {
+                run_workflow_step_agent_follow_up(
+                    db,
+                    chat_runner,
+                    session,
+                    agent,
+                    session_agent,
+                    &active_workflow_session,
+                    &prompt_to_send,
+                    step,
+                )
+                .await?
+            } else {
+                run_workflow_step_agent_prompt(
+                    db,
+                    chat_runner,
+                    session,
+                    agent,
+                    session_agent,
+                    Some(&active_workflow_session),
+                    &prompt_to_send,
+                    step,
+                )
+                .await?
+            };
+
+            match Self::parse_step_output_message(step.execution_id, step, &raw_output) {
+                Ok(message) => return Ok((message, raw_output)),
+                Err(err)
+                    if attempt < WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES
+                        && should_retry_workflow_protocol_parse_failure(&raw_output) =>
+                {
+                    tracing::warn!(
+                        step_id = %step.id,
+                        step_key = %step.step_key,
+                        attempt,
+                        error = %err,
+                        "workflow step protocol parse failed; retrying"
+                    );
+                    let schema =
+                        workflow_step_protocol_json_schema(step.execution_id, &step.step_key, true);
+                    prompt_to_send = build_workflow_protocol_retry_prompt(
+                        "step output",
+                        &schema,
+                        &err.to_string(),
+                        prompt,
+                        &raw_output,
+                    );
+                    attempt += 1;
+                    run_as_follow_up = true;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_step_review_protocol_with_retry(
+        db: &DBService,
+        pool: &SqlitePool,
+        chat_runner: &ChatRunner,
+        execution: &WorkflowExecution,
+        session: &ChatSession,
+        agent: &ChatAgent,
+        session_agent: &ChatSessionAgent,
+        workflow_session: &WorkflowAgentSession,
+        prompt: &str,
+        step: &WorkflowStep,
+    ) -> Result<(WorkflowReviewProtocolMessage, String), OrchestratorError> {
+        let mut attempt = 0;
+        let mut run_as_follow_up = false;
+        let mut prompt_to_send = prompt.to_string();
+
+        loop {
+            let active_workflow_session = if run_as_follow_up {
+                WorkflowAgentSession::find_by_id(pool, workflow_session.id)
+                    .await?
+                    .ok_or_else(|| {
+                        OrchestratorError::NotFound(format!(
+                            "workflow session {} not found",
+                            workflow_session.id
+                        ))
+                    })?
+            } else {
+                workflow_session.clone()
+            };
+
+            let raw_output = if run_as_follow_up {
+                run_workflow_step_agent_follow_up(
+                    db,
+                    chat_runner,
+                    session,
+                    agent,
+                    session_agent,
+                    &active_workflow_session,
+                    &prompt_to_send,
+                    step,
+                )
+                .await?
+            } else {
+                run_workflow_step_agent_prompt(
+                    db,
+                    chat_runner,
+                    session,
+                    agent,
+                    session_agent,
+                    Some(&active_workflow_session),
+                    &prompt_to_send,
+                    step,
+                )
+                .await?
+            };
+
+            match parse_review_protocol_output(execution.id, &step.step_key, &raw_output) {
+                Ok(message) => return Ok((message, raw_output)),
+                Err(err)
+                    if attempt < WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES
+                        && should_retry_workflow_protocol_parse_failure(&raw_output) =>
+                {
+                    tracing::warn!(
+                        step_id = %step.id,
+                        step_key = %step.step_key,
+                        attempt,
+                        error = %err,
+                        "workflow review protocol parse failed; retrying"
+                    );
+                    let schema = workflow_review_protocol_json_schema(execution.id, &step.step_key);
+                    prompt_to_send = build_workflow_protocol_retry_prompt(
+                        "step review output",
+                        &schema,
+                        &err.to_string(),
+                        prompt,
+                        &raw_output,
+                    );
+                    attempt += 1;
+                    run_as_follow_up = true;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     pub(super) fn step_message_error(
@@ -469,7 +645,7 @@ impl WorkflowOrchestrator {
             )
             .await?;
 
-            let review_prompt = build_lead_review_prompt(
+            let review_prompt = build_lead_review_prompt_with_schema(
                 &workflow_goal,
                 &waiting_review_step,
                 &persisted.result,
@@ -477,82 +653,50 @@ impl WorkflowOrchestrator {
                 &acceptance_criteria,
             );
 
-            let raw_review_output = match run_workflow_step_agent_prompt(
-                db,
-                chat_runner,
-                session,
-                lead_agent,
-                lead_session_agent,
-                Some(lead_workflow_session),
-                &review_prompt,
-                &waiting_review_step,
-            )
-            .await
-            {
-                Ok(raw_output) => raw_output,
-                Err(err) => {
-                    let failed_step = Self::transition_step_and_sync(
-                        pool,
-                        chat_runner,
-                        execution,
-                        &waiting_review_step,
-                        WorkflowStepStatus::Failed,
-                        "step_failed",
-                    )
-                    .await?;
-                    let _ = Self::write_transcript(
-                        pool,
-                        execution.id,
-                        Some(failed_step.round_id),
-                        Some(lead_workflow_session.id),
-                        Some(failed_step.id),
-                        "system",
-                        "message",
-                        &format!(
-                            "Lead review failed for step \"{}\": {}",
-                            failed_step.title, err
-                        ),
-                        None,
-                    )
-                    .await;
-                    return Ok(StepOutcome::Failed(err.to_string()));
-                }
-            };
-
-            let review_message = match parse_review_protocol_output(
-                execution.id,
-                &waiting_review_step.step_key,
-                &raw_review_output,
-            ) {
-                Ok(message) => message,
-                Err(err) => {
-                    let failed_step = Self::transition_step_and_sync(
-                        pool,
-                        chat_runner,
-                        execution,
-                        &waiting_review_step,
-                        WorkflowStepStatus::Failed,
-                        "step_failed",
-                    )
-                    .await?;
-                    let _ = Self::write_transcript(
-                        pool,
-                        execution.id,
-                        Some(failed_step.round_id),
-                        Some(lead_workflow_session.id),
-                        Some(failed_step.id),
-                        "system",
-                        "message",
-                        &format!(
-                            "Lead review parse failed for step \"{}\": {}",
-                            failed_step.title, err
-                        ),
-                        None,
-                    )
-                    .await;
-                    return Ok(StepOutcome::Failed(err.to_string()));
-                }
-            };
+            let (review_message, _raw_review_output) =
+                match Self::run_step_review_protocol_with_retry(
+                    db,
+                    pool,
+                    chat_runner,
+                    execution,
+                    session,
+                    lead_agent,
+                    lead_session_agent,
+                    lead_workflow_session,
+                    &review_prompt,
+                    &waiting_review_step,
+                )
+                .await
+                {
+                    Ok(raw_output) => raw_output,
+                    Err(err) => {
+                        let failed_step = Self::transition_step_and_sync(
+                            pool,
+                            chat_runner,
+                            execution,
+                            &waiting_review_step,
+                            WorkflowStepStatus::Failed,
+                            "step_failed",
+                        )
+                        .await?;
+                        let _ = Self::write_transcript(
+                            pool,
+                            execution.id,
+                            Some(failed_step.round_id),
+                            Some(lead_workflow_session.id),
+                            Some(failed_step.id),
+                            "system",
+                            "message",
+                            &format!(
+                                "Lead review failed for step \"{}\": {}",
+                                failed_step.title, err
+                            ),
+                            None,
+                        )
+                        .await;
+                        return Ok(StepOutcome::Failed(err.to_string()));
+                    }
+                };
 
             let WorkflowReviewProtocolMessage::ReviewResult {
                 verdict, feedback, ..
@@ -686,7 +830,7 @@ impl WorkflowOrchestrator {
                                     "step_revising_running",
                                 )
                                 .await?;
-                                let revision_prompt = build_step_revision_prompt(
+                                let revision_prompt = build_step_revision_prompt_with_schema(
                                     &running_revision_step,
                                     WorkflowRevisionFeedbackSource::User,
                                     &feedback,
@@ -694,82 +838,50 @@ impl WorkflowOrchestrator {
                                     running_revision_step.retry_count,
                                 );
 
-                                let raw_output = match run_workflow_step_agent_follow_up(
-                                    db,
-                                    chat_runner,
-                                    session,
-                                    agent,
-                                    session_agent,
-                                    workflow_session,
-                                    &revision_prompt,
-                                    &running_revision_step,
-                                )
-                                .await
-                                {
-                                    Ok(raw_output) => raw_output,
-                                    Err(err) => {
-                                        let failed_step = Self::transition_step_and_sync(
-                                            pool,
-                                            chat_runner,
-                                            execution,
-                                            &running_revision_step,
-                                            WorkflowStepStatus::Failed,
-                                            "step_failed",
-                                        )
-                                        .await?;
-                                        let _ = Self::write_transcript(
-                                            pool,
-                                            execution.id,
-                                            Some(failed_step.round_id),
-                                            Some(workflow_session.id),
-                                            Some(failed_step.id),
-                                            "system",
-                                            "message",
-                                            &format!(
-                                                "Step \"{}\" failed during user revision: {}",
-                                                failed_step.title, err
-                                            ),
-                                            None,
-                                        )
-                                        .await;
-                                        return Ok(StepOutcome::Failed(err.to_string()));
-                                    }
-                                };
-
-                                let protocol_message = match Self::parse_step_output_message(
-                                    execution.id,
-                                    &running_revision_step,
-                                    &raw_output,
-                                ) {
-                                    Ok(message) => message,
-                                    Err(err) => {
-                                        let failed_step = WorkflowStep::record_execution_result(
-                                            pool,
-                                            running_revision_step.id,
-                                            Uuid::new_v4(),
-                                            Some(
-                                                serde_json::to_string(&SummaryPayload {
-                                                    summary: err.to_string(),
-                                                    content: Some(raw_output),
-                                                    outputs: vec![],
-                                                })
-                                                .unwrap_or_else(|_| err.to_string()),
-                                            ),
-                                            None,
-                                        )
-                                        .await?;
-                                        Self::transition_step_and_sync(
-                                            pool,
-                                            chat_runner,
-                                            execution,
-                                            &failed_step,
-                                            WorkflowStepStatus::Failed,
-                                            "step_failed",
-                                        )
-                                        .await?;
-                                        return Ok(StepOutcome::Failed(err.to_string()));
-                                    }
-                                };
+                                let (protocol_message, _raw_output) =
+                                    match Self::run_step_agent_protocol_with_retry(
+                                        db,
+                                        pool,
+                                        chat_runner,
+                                        session,
+                                        agent,
+                                        session_agent,
+                                        workflow_session,
+                                        &revision_prompt,
+                                        &running_revision_step,
+                                        true,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => result,
+                                        Err(err) => {
+                                            let failed_step = Self::transition_step_and_sync(
+                                                pool,
+                                                chat_runner,
+                                                execution,
+                                                &running_revision_step,
+                                                WorkflowStepStatus::Failed,
+                                                "step_failed",
+                                            )
+                                            .await?;
+                                            let _ = Self::write_transcript(
+                                                pool,
+                                                execution.id,
+                                                Some(failed_step.round_id),
+                                                Some(workflow_session.id),
+                                                Some(failed_step.id),
+                                                "system",
+                                                "message",
+                                                &format!(
+                                                    "Step \"{}\" failed during user revision: {}",
+                                                    failed_step.title, err
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                            return Ok(StepOutcome::Failed(err.to_string()));
+                                        }
+                                    };
 
                                 match protocol_message {
                                     WorkflowStepProtocolMessage::FinalResult {
@@ -861,7 +973,7 @@ impl WorkflowOrchestrator {
                         "step_revising_running",
                     )
                     .await?;
-                    let revision_prompt = build_step_revision_prompt(
+                    let revision_prompt = build_step_revision_prompt_with_schema(
                         &running_revision_step,
                         WorkflowRevisionFeedbackSource::Lead,
                         &feedback,
@@ -869,82 +981,50 @@ impl WorkflowOrchestrator {
                         running_revision_step.retry_count,
                     );
 
-                    let raw_output = match run_workflow_step_agent_follow_up(
-                        db,
-                        chat_runner,
-                        session,
-                        agent,
-                        session_agent,
-                        workflow_session,
-                        &revision_prompt,
-                        &running_revision_step,
-                    )
-                    .await
-                    {
-                        Ok(raw_output) => raw_output,
-                        Err(err) => {
-                            let failed_step = Self::transition_step_and_sync(
-                                pool,
-                                chat_runner,
-                                execution,
-                                &running_revision_step,
-                                WorkflowStepStatus::Failed,
-                                "step_failed",
-                            )
-                            .await?;
-                            let _ = Self::write_transcript(
-                                pool,
-                                execution.id,
-                                Some(failed_step.round_id),
-                                Some(workflow_session.id),
-                                Some(failed_step.id),
-                                "system",
-                                "message",
-                                &format!(
-                                    "Step \"{}\" failed during revision: {}",
-                                    failed_step.title, err
-                                ),
-                                None,
-                            )
-                            .await;
-                            return Ok(StepOutcome::Failed(err.to_string()));
-                        }
-                    };
-
-                    let protocol_message = match Self::parse_step_output_message(
-                        execution.id,
-                        &running_revision_step,
-                        &raw_output,
-                    ) {
-                        Ok(message) => message,
-                        Err(err) => {
-                            let failed_step = WorkflowStep::record_execution_result(
-                                pool,
-                                running_revision_step.id,
-                                Uuid::new_v4(),
-                                Some(
-                                    serde_json::to_string(&SummaryPayload {
-                                        summary: err.to_string(),
-                                        content: Some(raw_output),
-                                        outputs: vec![],
-                                    })
-                                    .unwrap_or_else(|_| err.to_string()),
-                                ),
-                                None,
-                            )
-                            .await?;
-                            Self::transition_step_and_sync(
-                                pool,
-                                chat_runner,
-                                execution,
-                                &failed_step,
-                                WorkflowStepStatus::Failed,
-                                "step_failed",
-                            )
-                            .await?;
-                            return Ok(StepOutcome::Failed(err.to_string()));
-                        }
-                    };
+                    let (protocol_message, _raw_output) =
+                        match Self::run_step_agent_protocol_with_retry(
+                            db,
+                            pool,
+                            chat_runner,
+                            session,
+                            agent,
+                            session_agent,
+                            workflow_session,
+                            &revision_prompt,
+                            &running_revision_step,
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(err) => {
+                                let failed_step = Self::transition_step_and_sync(
+                                    pool,
+                                    chat_runner,
+                                    execution,
+                                    &running_revision_step,
+                                    WorkflowStepStatus::Failed,
+                                    "step_failed",
+                                )
+                                .await?;
+                                let _ = Self::write_transcript(
+                                    pool,
+                                    execution.id,
+                                    Some(failed_step.round_id),
+                                    Some(workflow_session.id),
+                                    Some(failed_step.id),
+                                    "system",
+                                    "message",
+                                    &format!(
+                                        "Step \"{}\" failed during revision: {}",
+                                        failed_step.title, err
+                                    ),
+                                    None,
+                                )
+                                .await;
+                                return Ok(StepOutcome::Failed(err.to_string()));
+                            }
+                        };
 
                     match protocol_message {
                         WorkflowStepProtocolMessage::FinalResult {
@@ -1269,7 +1349,7 @@ impl WorkflowOrchestrator {
         let pending_revision_feedback =
             Self::parse_pending_revision_feedback(running_step.revision_context.as_deref());
         let prompt = if let Some(pending_feedback) = pending_revision_feedback.as_ref() {
-            build_step_revision_prompt(
+            build_step_revision_prompt_with_schema(
                 &running_step,
                 pending_feedback.source,
                 &pending_feedback.feedback,
@@ -1277,7 +1357,7 @@ impl WorkflowOrchestrator {
                 running_step.retry_count,
             )
         } else {
-            build_step_execution_prompt(
+            build_step_execution_prompt_with_schema(
                 execution,
                 &workflow_goal,
                 &running_step,
@@ -1303,81 +1383,29 @@ impl WorkflowOrchestrator {
             running_step
         };
 
-        let protocol_message = match if pending_revision_feedback.is_some() {
-            run_workflow_step_agent_follow_up(
-                db,
-                chat_runner,
-                session,
-                agent,
-                session_agent,
-                workflow_session,
-                &prompt,
-                &running_step,
-            )
-            .await
-        } else {
-            run_workflow_step_agent_prompt(
-                db,
-                chat_runner,
-                session,
-                agent,
-                session_agent,
-                Some(workflow_session),
-                &prompt,
-                &running_step,
-            )
-            .await
-        } {
-            Ok(raw_output) => {
+        let protocol_message = match Self::run_step_agent_protocol_with_retry(
+            db,
+            pool,
+            chat_runner,
+            session,
+            agent,
+            session_agent,
+            workflow_session,
+            &prompt,
+            &running_step,
+            pending_revision_feedback.is_some(),
+        )
+        .await
+        {
+            Ok((message, raw_output)) => {
                 tracing::debug!(
                     "Raw output from step {}: {}",
                     running_step.title,
                     raw_output
                 );
-                match Self::parse_step_output_message(execution.id, &running_step, &raw_output) {
-                    Ok(message) => message,
-                    Err(err) => {
-                        let failed_step = WorkflowStep::record_execution_result(
-                            pool,
-                            running_step.id,
-                            Uuid::new_v4(),
-                            Some(
-                                serde_json::to_string(&SummaryPayload {
-                                    summary: err.to_string(),
-                                    content: Some(raw_output),
-                                    outputs: vec![],
-                                })
-                                .unwrap_or_else(|_| err.to_string()),
-                            ),
-                            None,
-                        )
-                        .await?;
-                        Self::transition_step_and_sync(
-                            pool,
-                            chat_runner,
-                            execution,
-                            &failed_step,
-                            WorkflowStepStatus::Failed,
-                            "step_failed",
-                        )
-                        .await?;
-                        let _ = Self::write_transcript(
-                            pool,
-                            execution.id,
-                            failed_step.round_id.into(),
-                            Some(workflow_session.id),
-                            Some(failed_step.id),
-                            "system",
-                            "message",
-                            &format!("Step \"{}\" failed: {}", failed_step.title, err),
-                            None,
-                        )
-                        .await;
-                        return Ok(StepOutcome::Failed(err.to_string()));
-                    }
-                }
+                message
             }
-            Err(WorkflowRuntimeError::Interrupted(reason)) => {
+            Err(OrchestratorError::Runtime(WorkflowRuntimeError::Interrupted(reason))) => {
                 let _ = Self::write_transcript(
                     pool,
                     execution.id,

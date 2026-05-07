@@ -40,6 +40,7 @@ pub enum LoopReviewProtocolMessage {
 pub fn build_loop_review_prompt(
     workflow_goal: &str,
     loop_def: &CompiledLoopDef,
+    execution_id: Uuid,
     loop_retry_count: i32,
     review_steps: &[LoopReviewPromptStepInput],
 ) -> String {
@@ -86,8 +87,14 @@ pub fn build_loop_review_prompt(
         })
         .collect::<Vec<_>>()
         .join(",\n");
+    let allowed_step_keys = review_steps
+        .iter()
+        .map(|step| step.step_key.clone())
+        .collect::<Vec<_>>();
+    let json_schema =
+        loop_review_protocol_json_schema(execution_id, &loop_def.loop_key, &allowed_step_keys);
 
-    format!(
+    let mut prompt = format!(
         r#"## 回路审核任务
 
 你是本次 workflow 的 Lead Agent，请对以下回路（阶段）的所有执行结果进行综合审核。
@@ -116,7 +123,7 @@ pub fn build_loop_review_prompt(
 {{
   "type": "loop_review_result",
   "loop_key": "{loop_key}",
-  "execution_id": "{{execution_id}}",
+  "execution_id": "{execution_id}",
   "verdict": "approved",
   "feedback": "回路审核通过的综合评价"
 }}
@@ -125,7 +132,7 @@ pub fn build_loop_review_prompt(
 {{
   "type": "loop_review_result",
   "loop_key": "{loop_key}",
-  "execution_id": "{{execution_id}}",
+  "execution_id": "{execution_id}",
   "verdict": "rejected",
   "feedback": "详细说明整体问题，以及对每个需要修改的节点的具体修改建议",
   "step_feedbacks": [
@@ -134,11 +141,59 @@ pub fn build_loop_review_prompt(
 }}"#,
         workflow_goal = workflow_goal,
         loop_key = loop_def.loop_key,
+        execution_id = execution_id,
         loop_retry_count = loop_retry_count,
         review_scope_step_titles = review_scope_step_titles,
         step_sections = step_sections,
         rejected_feedback_template = rejected_feedback_template,
-    )
+    );
+    prompt.push_str("\n\nRequired JSON Schema:\n```json\n");
+    prompt.push_str(&json_schema);
+    prompt.push_str("\n```\nReturn ONLY one JSON object matching this schema.\n");
+    prompt
+}
+
+pub fn loop_review_protocol_json_schema(
+    execution_id: Uuid,
+    loop_key: &str,
+    allowed_step_keys: &[String],
+) -> String {
+    let execution_id_schema = if execution_id.is_nil() {
+        serde_json::json!({
+            "type": "string",
+            "description": "Must be the current workflow execution id"
+        })
+    } else {
+        serde_json::json!({ "const": execution_id.to_string() })
+    };
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["type", "loop_key", "execution_id", "verdict", "feedback"],
+        "additionalProperties": false,
+        "properties": {
+            "type": { "const": "loop_review_result" },
+            "loop_key": { "const": loop_key },
+            "execution_id": execution_id_schema,
+            "verdict": { "enum": ["approved", "rejected"] },
+            "feedback": { "type": "string", "minLength": 1 },
+            "step_feedbacks": {
+                "type": "array",
+                "default": [],
+                "items": {
+                    "type": "object",
+                    "required": ["step_key", "feedback"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "step_key": { "enum": allowed_step_keys },
+                        "feedback": { "type": "string", "minLength": 1 }
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 pub fn build_loop_rejection_prompt(
@@ -343,6 +398,7 @@ mod tests {
         let prompt = build_loop_review_prompt(
             "Deliver a coherent feature",
             &sample_loop_def(),
+            Uuid::nil(),
             1,
             &[
                 LoopReviewPromptStepInput {

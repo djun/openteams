@@ -28,11 +28,13 @@ use super::{
     },
     workflow_review::{
         LoopReviewPromptStepInput, LoopReviewProtocolMessage, build_loop_review_prompt,
-        parse_loop_review_output,
+        loop_review_protocol_json_schema, parse_loop_review_output,
     },
     workflow_runtime::{
-        SummaryPayload, WorkflowRevisionFeedbackSource, parse_summary_payload,
-        run_workflow_step_agent_prompt,
+        SummaryPayload, WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES, WorkflowRevisionFeedbackSource,
+        build_workflow_protocol_retry_prompt, parse_summary_payload,
+        run_workflow_step_agent_follow_up, run_workflow_step_agent_prompt,
+        should_retry_workflow_protocol_parse_failure,
     },
 };
 
@@ -313,26 +315,31 @@ impl<'a> LoopExecutor<'a> {
         let prompt = build_loop_review_prompt(
             &workflow_goal,
             loop_def,
+            self.execution.id,
             workflow_loop.retry_count + 1,
             &review_inputs,
         );
-        let raw_output = run_workflow_step_agent_prompt(
-            self.db,
-            self.chat_runner,
-            self.session,
-            agent,
-            session_agent,
-            Some(workflow_session),
-            &prompt,
-            &running_review_step,
-        )
-        .await?;
+        let allowed_step_keys = review_inputs
+            .iter()
+            .map(|input| input.step_key.clone())
+            .collect::<Vec<_>>();
+        let (review_message, raw_output) = self
+            .run_loop_review_protocol_with_retry(
+                agent,
+                session_agent,
+                workflow_session,
+                workflow_loop,
+                &running_review_step,
+                &prompt,
+                &allowed_step_keys,
+            )
+            .await?;
         let LoopReviewProtocolMessage::LoopReviewResult {
             verdict,
             feedback,
             step_feedbacks,
             ..
-        } = parse_loop_review_output(self.execution.id, &workflow_loop.loop_key, &raw_output)?;
+        } = review_message;
 
         let result_summary = SummaryPayload {
             summary: feedback.clone(),
@@ -475,6 +482,95 @@ impl<'a> LoopExecutor<'a> {
         )
         .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_loop_review_protocol_with_retry(
+        &self,
+        agent: &ChatAgent,
+        session_agent: &ChatSessionAgent,
+        workflow_session: &WorkflowAgentSession,
+        workflow_loop: &WorkflowLoop,
+        review_step: &WorkflowStep,
+        prompt: &str,
+        allowed_step_keys: &[String],
+    ) -> Result<(LoopReviewProtocolMessage, String), OrchestratorError> {
+        let mut attempt = 0;
+        let mut run_as_follow_up = false;
+        let mut prompt_to_send = prompt.to_string();
+
+        loop {
+            let active_workflow_session = if run_as_follow_up {
+                WorkflowAgentSession::find_by_id(self.pool, workflow_session.id)
+                    .await?
+                    .ok_or_else(|| {
+                        OrchestratorError::NotFound(format!(
+                            "workflow session {} not found",
+                            workflow_session.id
+                        ))
+                    })?
+            } else {
+                workflow_session.clone()
+            };
+
+            let raw_output = if run_as_follow_up {
+                run_workflow_step_agent_follow_up(
+                    self.db,
+                    self.chat_runner,
+                    self.session,
+                    agent,
+                    session_agent,
+                    &active_workflow_session,
+                    &prompt_to_send,
+                    review_step,
+                )
+                .await?
+            } else {
+                run_workflow_step_agent_prompt(
+                    self.db,
+                    self.chat_runner,
+                    self.session,
+                    agent,
+                    session_agent,
+                    Some(&active_workflow_session),
+                    &prompt_to_send,
+                    review_step,
+                )
+                .await?
+            };
+
+            match parse_loop_review_output(self.execution.id, &workflow_loop.loop_key, &raw_output)
+            {
+                Ok(message) => return Ok((message, raw_output)),
+                Err(err)
+                    if attempt < WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES
+                        && should_retry_workflow_protocol_parse_failure(&raw_output) =>
+                {
+                    tracing::warn!(
+                        loop_id = %workflow_loop.id,
+                        loop_key = %workflow_loop.loop_key,
+                        attempt,
+                        error = %err,
+                        "workflow loop review protocol parse failed; retrying"
+                    );
+                    let schema = loop_review_protocol_json_schema(
+                        self.execution.id,
+                        &workflow_loop.loop_key,
+                        allowed_step_keys,
+                    );
+                    prompt_to_send = build_workflow_protocol_retry_prompt(
+                        "loop review output",
+                        &schema,
+                        &err.to_string(),
+                        prompt,
+                        &raw_output,
+                    );
+                    attempt += 1;
+                    run_as_follow_up = true;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     async fn review_prompt_inputs(

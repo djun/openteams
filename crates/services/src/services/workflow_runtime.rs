@@ -58,6 +58,7 @@ const WORKFLOW_DRAIN_TIMEOUT: Duration = Duration::from_millis(35);
 const WORKFLOW_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const WORKFLOW_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const EXECUTOR_PROFILE_VARIANT_KEY: &str = "executor_profile_variant";
+pub const WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES: u32 = 1;
 
 /// Global registry: step_id → (CancellationToken, child_pid).
 /// Used to cancel a running agent process when a step is interrupted.
@@ -722,6 +723,143 @@ pub fn extract_json_payload(raw_output: &str) -> Option<String> {
     (start < end).then(|| trimmed[start..=end].to_string())
 }
 
+pub fn workflow_step_protocol_json_schema(
+    execution_id: Uuid,
+    step_key: &str,
+    allow_interaction_requests: bool,
+) -> String {
+    let mut variants = vec![
+        serde_json::json!({
+            "type": "object",
+            "required": ["type", "step_key", "execution_id", "summary", "content"],
+            "additionalProperties": false,
+            "properties": {
+                "type": { "const": "final_result" },
+                "step_key": { "const": step_key },
+                "execution_id": { "const": execution_id.to_string() },
+                "summary": { "type": "string", "minLength": 1 },
+                "content": { "type": "string" },
+                "outputs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": []
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "object",
+            "required": ["type", "step_key", "execution_id", "message"],
+            "additionalProperties": false,
+            "properties": {
+                "type": { "const": "error" },
+                "step_key": { "const": step_key },
+                "execution_id": { "const": execution_id.to_string() },
+                "message": { "type": "string", "minLength": 1 },
+                "content": { "type": ["string", "null"] }
+            }
+        }),
+    ];
+
+    if allow_interaction_requests {
+        variants.extend([
+            serde_json::json!({
+                "type": "object",
+                "required": ["type", "step_key", "execution_id", "title"],
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "enum": ["approval_request", "permission_request"] },
+                    "step_key": { "const": step_key },
+                    "execution_id": { "const": execution_id.to_string() },
+                    "title": { "type": "string", "minLength": 1 },
+                    "description": { "type": ["string", "null"] }
+                }
+            }),
+            serde_json::json!({
+                "type": "object",
+                "required": ["type", "step_key", "execution_id", "message"],
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "const": "continue_confirmation" },
+                    "step_key": { "const": step_key },
+                    "execution_id": { "const": execution_id.to_string() },
+                    "message": { "type": "string", "minLength": 1 },
+                    "description": { "type": ["string", "null"] }
+                }
+            }),
+            serde_json::json!({
+                "type": "object",
+                "required": ["type", "step_key", "execution_id", "prompt"],
+                "additionalProperties": false,
+                "properties": {
+                    "type": { "const": "input_request" },
+                    "step_key": { "const": step_key },
+                    "execution_id": { "const": execution_id.to_string() },
+                    "prompt": { "type": "string", "minLength": 1 },
+                    "description": { "type": ["string", "null"] },
+                    "placeholder": { "type": ["string", "null"] }
+                }
+            }),
+        ]);
+    }
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": variants
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn workflow_review_protocol_json_schema(execution_id: Uuid, step_key: &str) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["type", "step_key", "execution_id", "verdict", "feedback"],
+        "additionalProperties": false,
+        "properties": {
+            "type": { "const": "review_result" },
+            "step_key": { "const": step_key },
+            "execution_id": { "const": execution_id.to_string() },
+            "verdict": { "enum": ["approved", "rejected"] },
+            "feedback": { "type": "string", "minLength": 1 }
+        }
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn build_workflow_protocol_retry_prompt(
+    protocol_name: &str,
+    schema: &str,
+    error: &str,
+    previous_input: &str,
+    previous_output: &str,
+) -> String {
+    format!(
+        r#"Your previous workflow {protocol_name} response did not match the required JSON protocol.
+Error: {error}
+
+Retry the same workflow request. Respond with ONLY one JSON object. Do not include Markdown fences, prose, explanations, or extra text.
+
+Required JSON Schema:
+```json
+{schema}
+```
+
+Previous workflow request:
+<BEGIN_WORKFLOW_REQUEST>
+{previous_input}
+<END_WORKFLOW_REQUEST>
+
+Previous invalid response:
+<BEGIN_INVALID_RESPONSE>
+{previous_output}
+<END_INVALID_RESPONSE>"#
+    )
+}
+
+pub fn should_retry_workflow_protocol_parse_failure(raw_output: &str) -> bool {
+    !raw_output.trim().is_empty()
+}
+
 pub fn resolve_workflow_goal(
     explicit_goal: Option<&str>,
     messages: &[ChatMessage],
@@ -1032,6 +1170,31 @@ step 指令：
     )
 }
 
+pub fn build_step_execution_prompt_with_schema(
+    execution: &WorkflowExecution,
+    workflow_goal: &str,
+    step: &WorkflowStep,
+    completed_dependency_summaries: &[String],
+    step_transcript_context: Option<&str>,
+) -> String {
+    let mut prompt = build_step_execution_prompt(
+        execution,
+        workflow_goal,
+        step,
+        completed_dependency_summaries,
+        step_transcript_context,
+    );
+    prompt.push_str("\n\nRequired JSON Schema:\n```json\n");
+    prompt.push_str(&workflow_step_protocol_json_schema(
+        execution.id,
+        &step.step_key,
+        true,
+    ));
+    prompt.push_str("\n```\n");
+    prompt.push_str("Return ONLY one JSON object matching this schema.\n");
+    prompt
+}
+
 pub fn build_lead_review_prompt(
     workflow_goal: &str,
     step: &WorkflowStep,
@@ -1125,6 +1288,30 @@ pub fn build_lead_review_prompt(
     )
 }
 
+pub fn build_lead_review_prompt_with_schema(
+    workflow_goal: &str,
+    step: &WorkflowStep,
+    result: &WorkflowStepRunResult,
+    dependency_summaries: &[String],
+    acceptance_criteria: &[String],
+) -> String {
+    let mut prompt = build_lead_review_prompt(
+        workflow_goal,
+        step,
+        result,
+        dependency_summaries,
+        acceptance_criteria,
+    );
+    prompt.push_str("\n\nRequired JSON Schema:\n```json\n");
+    prompt.push_str(&workflow_review_protocol_json_schema(
+        step.execution_id,
+        &step.step_key,
+    ));
+    prompt.push_str("\n```\n");
+    prompt.push_str("Return ONLY one JSON object matching this schema.\n");
+    prompt
+}
+
 pub fn build_step_revision_prompt(
     step: &WorkflowStep,
     feedback_source: WorkflowRevisionFeedbackSource,
@@ -1185,6 +1372,31 @@ step 指令：{step_instructions}"#,
         step_title = step.title,
         step_instructions = step.instructions,
     )
+}
+
+pub fn build_step_revision_prompt_with_schema(
+    step: &WorkflowStep,
+    feedback_source: WorkflowRevisionFeedbackSource,
+    feedback_content: &str,
+    previous_summary: &str,
+    retry_count: i32,
+) -> String {
+    let mut prompt = build_step_revision_prompt(
+        step,
+        feedback_source,
+        feedback_content,
+        previous_summary,
+        retry_count,
+    );
+    prompt.push_str("\n\nRequired JSON Schema:\n```json\n");
+    prompt.push_str(&workflow_step_protocol_json_schema(
+        step.execution_id,
+        &step.step_key,
+        true,
+    ));
+    prompt.push_str("\n```\n");
+    prompt.push_str("Return ONLY one JSON object matching this schema.\n");
+    prompt
 }
 
 pub fn parse_step_protocol_output(

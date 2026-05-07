@@ -20,7 +20,7 @@ use super::{
         workflow_iteration::IterationManager,
         workflow_runtime::{
             SummaryPayload, WorkflowRuntimeError, parse_summary_payload,
-            run_workflow_step_agent_follow_up,
+            workflow_step_protocol_json_schema,
         },
     },
     OrchestratorError, ResolvedTranscriptAction, WorkflowOrchestrator, load_agents_for_session,
@@ -291,8 +291,9 @@ impl WorkflowOrchestrator {
                 "submit step input for following up prompt"
             );
 
-            let protocol_message = match run_workflow_step_agent_follow_up(
+            let protocol_message = match Self::run_step_agent_protocol_with_retry(
                 db,
+                pool,
                 chat_runner,
                 &session,
                 agent,
@@ -300,71 +301,12 @@ impl WorkflowOrchestrator {
                 workflow_session,
                 &follow_up_prompt,
                 &running_step,
+                true,
             )
             .await
             {
-                Ok(raw_output) => {
-                    match Self::parse_step_output_message(
-                        active_execution.id,
-                        &running_step,
-                        &raw_output,
-                    ) {
-                        Ok(message) => message,
-                        Err(err) => {
-                            let failed_step = WorkflowStep::record_execution_result(
-                                pool,
-                                running_step.id,
-                                Uuid::new_v4(),
-                                Some(
-                                    serde_json::to_string(&SummaryPayload {
-                                        summary: err.to_string(),
-                                        content: Some(raw_output),
-                                        outputs: vec![],
-                                    })
-                                    .unwrap_or_else(|_| err.to_string()),
-                                ),
-                                None,
-                            )
-                            .await?;
-                            Self::transition_step_and_sync(
-                                pool,
-                                chat_runner,
-                                &active_execution,
-                                &failed_step,
-                                WorkflowStepStatus::Failed,
-                                "step_failed",
-                            )
-                            .await?;
-                            let _ = Self::write_transcript(
-                                pool,
-                                active_execution.id,
-                                failed_step.round_id.into(),
-                                Some(workflow_session.id),
-                                Some(failed_step.id),
-                                "system",
-                                "message",
-                                &format!("Step \"{}\" failed: {}", failed_step.title, err),
-                                None,
-                            )
-                            .await;
-                            let execution = Self::refresh_execution_projection_with_reason(
-                                pool,
-                                chat_runner,
-                                active_execution.id,
-                                Some(err.to_string()),
-                                "step_input_failed",
-                                vec![running_step.id.to_string()],
-                            )
-                            .await?;
-                            return Ok(ResolvedTranscriptAction {
-                                transcript: input_transcript.clone(),
-                                execution,
-                                should_wake_scheduler: false,
-                            });
-                        }
-                    }
-                }
-                Err(WorkflowRuntimeError::Interrupted(reason)) => {
+                Ok((message, _raw_output)) => message,
+                Err(OrchestratorError::Runtime(WorkflowRuntimeError::Interrupted(reason))) => {
                     let _ = Self::write_transcript(
                         pool,
                         active_execution.id,
@@ -815,6 +757,8 @@ impl WorkflowOrchestrator {
                 "Do not restart the whole task from scratch unless required. Resume from the failed point and fix the issue that caused the failure."
             }
         };
+        let json_schema =
+            workflow_step_protocol_json_schema(step.execution_id, &step.step_key, true);
         format!(
             r#"{opening}
 
@@ -853,6 +797,11 @@ Workflow step protocol JSON schema:
   "placeholder": "optional when type=input_request"
 }}
 
+Required JSON Schema:
+```json
+{json_schema}
+```
+
 Rules:
 - step_key must stay exactly "{step_key}".
 - execution_id must stay exactly "{execution_id}".
@@ -868,7 +817,8 @@ Rules:
             step_key = step.step_key,
             execution_id = step.execution_id,
             step_type = format!("{:?}", step.step_type).to_lowercase(),
-            step_instructions = step.instructions
+            step_instructions = step.instructions,
+            json_schema = json_schema,
         )
     }
 }
