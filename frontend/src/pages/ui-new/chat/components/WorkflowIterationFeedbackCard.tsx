@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertCircle } from 'lucide-react';
+import { ChevronUp, ChevronDown } from 'lucide-react';
 import type { WorkflowIterationSummaryData } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -15,33 +15,27 @@ type WorkflowIterationFeedbackPayload = {
 
 type WorkflowIterationFeedbackCardProps = {
   currentRound: number;
+  completedSteps: number;
+  totalSteps: number;
+  runningStepTitle?: string | null;
   iterationHistory: WorkflowIterationSummaryData[];
   canReviewCurrentRound?: boolean;
   pendingActionId?: string | null;
   onSubmit?: (payload: WorkflowIterationFeedbackPayload) => void;
 };
 
-function roundStatusTone(status: string) {
-  switch (status) {
-    case 'accepted':
-      return 'border-emerald-300 bg-emerald-50 text-emerald-700';
-    case 'rejected':
-      return 'border-rose-300 bg-rose-50 text-rose-700';
-    case 'running':
-      return 'border-blue-300 bg-blue-50 text-blue-700';
-    default:
-      return 'border-slate-200 bg-slate-50 text-slate-600';
-  }
-}
-
 export function WorkflowIterationFeedbackCard({
   currentRound,
+  completedSteps,
+  totalSteps,
+  runningStepTitle,
   iterationHistory,
   canReviewCurrentRound: canReviewCurrentRoundProp = false,
   pendingActionId,
   onSubmit,
 }: WorkflowIterationFeedbackCardProps) {
-  const [selectedRound, setSelectedRound] = useState<number | null>(null);
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [showReview, setShowReview] = useState(false);
   const [expandedReject, setExpandedReject] = useState(false);
   const [whatWrong, setWhatWrong] = useState('');
   const [expected, setExpected] = useState('');
@@ -57,32 +51,19 @@ export function WorkflowIterationFeedbackCard({
     [iterationHistory]
   );
 
-  useEffect(() => {
-    if (orderedHistory.length === 0) {
-      setSelectedRound(null);
-      return;
-    }
-
-    setSelectedRound((previous) => {
-      if (
-        previous != null &&
-        orderedHistory.some((item) => item.round_index === previous)
-      ) {
-        return previous;
-      }
-      return orderedHistory[0].round_index;
-    });
-  }, [orderedHistory]);
-
-  const selectedIteration =
-    orderedHistory.find((item) => item.round_index === selectedRound) ?? null;
-  const canSubmit = !!onSubmit;
-  const disabled = !!pendingActionId;
   const latestIteration = orderedHistory[0] ?? null;
   const canReviewCurrentRound =
     canReviewCurrentRoundProp &&
     currentRound > 0 &&
     latestIteration?.round_index === currentRound;
+  const canSubmit = !!onSubmit;
+  const disabled = !!pendingActionId;
+
+  useEffect(() => {
+    if (canReviewCurrentRound) {
+      setShowReview(true);
+    }
+  }, [canReviewCurrentRound]);
 
   const handleAccept = () => {
     setExpandedReject(false);
@@ -95,14 +76,12 @@ export function WorkflowIterationFeedbackCard({
       setExpandedReject(true);
       return;
     }
-
     const nextWhatWrong = whatWrong.trim();
     const nextExpected = expected.trim();
     if (!nextWhatWrong || !nextExpected) {
-      setValidationError('Reject 需要填写 what_wrong 和 expected。');
+      setValidationError('Reject requires what_wrong and expected.');
       return;
     }
-
     setValidationError(null);
     onSubmit?.({
       action: 'reject',
@@ -115,143 +94,214 @@ export function WorkflowIterationFeedbackCard({
     });
   };
 
-  return (
-    <div className="bg-white border border-slate-200 p-4 rounded-xl shadow-sm">
-      <div className="text-xs font-bold text-blue-700 flex items-center gap-2 mb-3">
-        <AlertCircle className="w-4 h-4" /> Iteration History
-        <span className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-blue-600">
-          Round {currentRound}
-        </span>
-      </div>
+  const progressPercent =
+    totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
 
-      {orderedHistory.length > 0 ? (
-        <>
-          <div className="flex flex-wrap gap-2 mb-3">
-            {orderedHistory.map((item) => (
-              <button
-                key={item.round_index}
-                type="button"
-                onClick={() => setSelectedRound(item.round_index)}
-                className={cn(
-                  'rounded-full border px-3 py-1 text-xs font-semibold transition-colors',
-                  selectedRound === item.round_index
-                    ? 'border-indigo-400 bg-indigo-50 text-indigo-700'
-                    : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'
-                )}
-              >
-                Round {item.round_index}
-              </button>
-            ))}
-          </div>
-
-          {selectedIteration && (
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 mb-3">
-              <span
-                className={cn(
-                  'inline-block rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest mb-2',
-                  roundStatusTone(selectedIteration.status)
-                )}
-              >
-                {selectedIteration.status}
-              </span>
-              {selectedIteration.result_summary && (
-                <div className="text-[11px] text-slate-600 leading-relaxed mb-2">
-                  {selectedIteration.result_summary}
-                </div>
-              )}
-              {selectedIteration.user_feedback && (
-                <div className="rounded-lg border border-rose-200 bg-white p-2.5 text-[11px] text-rose-700 leading-relaxed">
-                  {selectedIteration.user_feedback}
-                </div>
-              )}
-            </div>
-          )}
-        </>
-      ) : (
-        <div className="text-[11px] text-slate-400 mb-3">
-          No iteration history yet.
+  if (isCollapsed) {
+    return (
+      <button
+        type="button"
+        onClick={() => setIsCollapsed(false)}
+        className="flex items-center gap-3 bg-white border border-slate-200 rounded-full px-4 py-1.5 shadow-sm hover:border-blue-400 transition-all group"
+        title={`Round ${currentRound} · ${completedSteps}/${totalSteps} completed${runningStepTitle ? ` · Running: ${runningStepTitle}` : ''}`}
+      >
+        <div className="flex items-center gap-1.5">
+          <div className={cn(
+            "w-2 h-2 bg-blue-500 rounded-full",
+            runningStepTitle && "animate-pulse"
+          )} />
+          <span className="text-xs font-bold text-slate-700">R{currentRound}</span>
         </div>
-      )}
+        <div className="h-3 w-[1px] bg-slate-200" />
+        <span className="text-xs font-medium text-slate-600">{completedSteps}/{totalSteps} Steps</span>
+        <div className="h-3 w-[1px] bg-slate-200" />
+        <span className="text-xs font-bold text-blue-600">{progressPercent}%</span>
+      </button>
+    );
+  }
 
-      {canReviewCurrentRound && (
-        <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
-          <div className="text-[10px] font-bold uppercase tracking-widest text-amber-800 mb-2">
-            Current Round Decision
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden transition-all duration-300 hover:border-blue-200 max-w-md w-full">
+      {/* Header/Expandable Area */}
+      <button
+        type="button"
+        onClick={() => setIsCollapsed(true)}
+        className="w-full text-left p-3.5 focus:outline-none group hover:bg-slate-50/50 transition-colors"
+      >
+        <div className="flex items-center gap-3 mb-2.5">
+          <div className="bg-blue-50 text-blue-600 px-2 py-0.5 rounded-lg text-[10px] font-bold tracking-tight border border-blue-100 uppercase shrink-0">
+            Round {currentRound}
           </div>
-          <p className="text-[11px] text-slate-600 mb-3 leading-relaxed">
-            Accept the current round or reject it with structured feedback.
-          </p>
+          <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden relative">
+            <div
+              className="h-full bg-blue-500 rounded-full shadow-[0_0_8px_rgba(59,130,246,0.5)] transition-all duration-500"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+          <span className="text-[10px] font-bold text-blue-600 shrink-0">{progressPercent}%</span>
+        </div>
+
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="flex flex-col">
+              <span className="text-[10px] text-slate-400 uppercase font-medium">Steps</span>
+              <span className="text-xs font-bold text-slate-700">{completedSteps} / {totalSteps}</span>
+            </div>
+            <div className="h-6 w-[1px] bg-slate-100" />
+            <div className="flex flex-col">
+              <span className="text-[10px] text-slate-400 uppercase font-medium">Status</span>
+              <div className="flex items-center gap-1.5">
+                {runningStepTitle ? (
+                  <>
+                    <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
+                    <span className="text-xs font-bold text-emerald-600">Running</span>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-2 h-2 bg-slate-300 rounded-full" />
+                    <span className="text-xs font-bold text-slate-400">Idle</span>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+          <ChevronUp className="w-4 h-4 text-slate-300 group-hover:text-blue-500 transition-colors" />
+        </div>
+
+        {runningStepTitle && (
+          <div className="mt-3 py-2 px-3 bg-slate-50 rounded-xl border border-slate-100">
+            <span className="text-[10px] text-slate-400 block mb-0.5 uppercase">Current Step</span>
+            <p className="text-xs text-slate-600 font-medium truncate">{runningStepTitle}</p>
+          </div>
+        )}
+      </button>
+
+      {/* Review Section */}
+      {canReviewCurrentRound && showReview && (
+        <div className={cn(
+          "border-t transition-all duration-300",
+          expandedReject ? "bg-rose-50/50 border-rose-100 p-4" : "bg-indigo-50/50 border-indigo-100 p-4"
+        )}>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <div className={cn(
+                "w-1.5 h-1.5 rounded-full",
+                expandedReject ? "bg-rose-500" : "bg-indigo-500"
+              )} />
+              <span className={cn(
+                "text-[10px] font-bold uppercase tracking-wider",
+                expandedReject ? "text-rose-700" : "text-indigo-700"
+              )}>
+                {expandedReject ? "Reject with Feedback" : "Review Required"}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowReview(false)}
+              className="text-slate-400 hover:text-slate-600 transition-colors"
+            >
+              <ChevronDown className="w-4 h-4" />
+            </button>
+          </div>
 
           {expandedReject && (
-            <div className="grid gap-2 mb-3">
-              <textarea
-                value={whatWrong}
-                onChange={(e) => setWhatWrong(e.target.value)}
-                rows={2}
-                disabled={disabled || !canSubmit}
-                placeholder="what_wrong"
-                className="w-full rounded-lg border border-rose-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-rose-400 disabled:opacity-60"
-              />
-              <textarea
-                value={expected}
-                onChange={(e) => setExpected(e.target.value)}
-                rows={2}
-                disabled={disabled || !canSubmit}
-                placeholder="expected"
-                className="w-full rounded-lg border border-rose-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-rose-400 disabled:opacity-60"
-              />
-              <select
-                value={priority}
-                onChange={(e) =>
-                  setPriority(e.target.value as 'high' | 'medium' | 'low')
-                }
-                disabled={disabled || !canSubmit}
-                className="rounded-lg border border-rose-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none focus:border-rose-400 disabled:opacity-60"
-              >
-                <option value="high">high</option>
-                <option value="medium">medium</option>
-                <option value="low">low</option>
-              </select>
-              <textarea
-                value={additionalNotes}
-                onChange={(e) => setAdditionalNotes(e.target.value)}
-                rows={2}
-                disabled={disabled || !canSubmit}
-                placeholder="additional_notes"
-                className="w-full rounded-lg border border-rose-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-rose-400 disabled:opacity-60"
-              />
+            <div className="space-y-3 mb-4">
+              <div>
+                <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">What went wrong?</label>
+                <textarea
+                  value={whatWrong}
+                  onChange={(e) => setWhatWrong(e.target.value)}
+                  rows={2}
+                  disabled={disabled || !canSubmit}
+                  placeholder="Describe the issue..."
+                  className="w-full bg-white border border-slate-200 rounded-xl p-3 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-rose-200 focus:border-rose-300 transition-all placeholder:text-slate-300 disabled:opacity-60"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Expected outcome</label>
+                <textarea
+                  value={expected}
+                  onChange={(e) => setExpected(e.target.value)}
+                  rows={2}
+                  disabled={disabled || !canSubmit}
+                  placeholder="What should have happened?"
+                  className="w-full bg-white border border-slate-200 rounded-xl p-3 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-rose-200 focus:border-rose-300 transition-all placeholder:text-slate-300 disabled:opacity-60"
+                />
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Priority</label>
+                  <select
+                    value={priority}
+                    onChange={(e) => setPriority(e.target.value as 'high' | 'medium' | 'low')}
+                    disabled={disabled || !canSubmit}
+                    className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-rose-200 focus:border-rose-300 disabled:opacity-60"
+                  >
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Additional Notes</label>
+                <textarea
+                  value={additionalNotes}
+                  onChange={(e) => setAdditionalNotes(e.target.value)}
+                  rows={2}
+                  disabled={disabled || !canSubmit}
+                  placeholder="Optional notes..."
+                  className="w-full bg-white border border-slate-200 rounded-xl p-3 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-rose-200 focus:border-rose-300 transition-all placeholder:text-slate-300 disabled:opacity-60"
+                />
+              </div>
               {validationError && (
-                <div className="text-[10px] text-rose-600">
+                <div className="text-[10px] text-rose-600 font-medium">
                   {validationError}
                 </div>
               )}
             </div>
           )}
 
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={handleAccept}
-              disabled={disabled || !canSubmit}
-              className="flex-1 py-1.5 bg-emerald-600 text-white rounded text-[10px] font-bold hover:bg-emerald-700 transition-colors shadow-sm disabled:opacity-50"
-            >
-              ACCEPT
-            </button>
+          <div className="flex gap-3">
+            {!expandedReject && (
+              <button
+                type="button"
+                onClick={handleAccept}
+                disabled={disabled || !canSubmit}
+                className="flex-1 bg-indigo-50 border border-indigo-100 text-indigo-700 py-2.5 rounded-xl text-xs font-bold hover:bg-indigo-100 hover:border-indigo-200 transition-all active:scale-95 disabled:opacity-50 disabled:active:scale-100 shadow-sm"
+              >
+                ACCEPT
+              </button>
+            )}
             <button
               type="button"
               onClick={handleReject}
               disabled={disabled || !canSubmit}
-              className={`flex-1 py-1.5 rounded text-[10px] font-bold transition-colors disabled:opacity-50 ${
+              className={cn(
+                "flex-1 py-2.5 rounded-xl text-xs font-bold transition-all active:scale-95 disabled:opacity-50 disabled:active:scale-100 shadow-sm",
                 expandedReject
-                  ? 'bg-rose-50 border border-rose-200 text-rose-700'
-                  : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
-              }`}
+                  ? "bg-rose-50 border border-rose-100 text-rose-700 hover:bg-rose-100 hover:border-rose-200"
+                  : "bg-white border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+              )}
             >
-              {expandedReject ? 'SUBMIT REJECT' : 'REJECT'}
+              {expandedReject ? 'SUBMIT REJECTION' : 'REJECT'}
             </button>
+            {expandedReject && (
+              <button
+                type="button"
+                onClick={() => {
+                  setExpandedReject(false);
+                  setValidationError(null);
+                }}
+                className="px-4 bg-white border border-slate-200 text-slate-400 py-2.5 rounded-xl text-xs font-bold hover:bg-slate-50 hover:text-slate-600 transition-all"
+              >
+                CANCEL
+              </button>
+            )}
           </div>
         </div>
       )}
     </div>
   );
 }
+

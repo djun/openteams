@@ -440,6 +440,9 @@ export function ChatWorkflowCard({
         <div className="mt-4">
           <WorkflowIterationFeedbackCard
             currentRound={projection.current_round}
+            completedSteps={projection.completed_step_count}
+            totalSteps={projection.total_step_count}
+            runningStepTitle={projection.steps.find((s) => s.status === 'running' || s.status === 'failed')?.title ?? null}
             iterationHistory={projection.iteration_history}
             canReviewCurrentRound={canReviewCurrentRound}
             pendingActionId={pendingActionId}

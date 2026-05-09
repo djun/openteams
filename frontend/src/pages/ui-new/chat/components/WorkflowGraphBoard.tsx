@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import ELK from 'elkjs/lib/elk.bundled.js';
 import {
   ArrowClockwiseIcon,
+  ArrowsClockwiseIcon,
   ArrowsInSimpleIcon,
-  ArrowsOutSimpleIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
@@ -373,7 +373,6 @@ export function WorkflowGraphBoard({
   const [layoutError, setLayoutError] = useState<string | null>(null);
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
-  const [isFullscreen, setIsFullscreen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const isDragging = useRef(false);
   const lastMousePos = useRef({ x: 0, y: 0 });
@@ -495,15 +494,6 @@ export function WorkflowGraphBoard({
   }, [layoutTopologyKey]);
 
   useEffect(() => {
-    if (!isFullscreen) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setIsFullscreen(false);
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isFullscreen]);
-
-  useEffect(() => {
     const container = containerRef.current;
     if (!container) return undefined;
 
@@ -577,74 +567,94 @@ export function WorkflowGraphBoard({
     switch (status) {
       case 'completed':
       case 'pre_completed':
-        return 'border-emerald-500 shadow-sm';
+        return 'border-emerald-500 bg-emerald-50 shadow-sm';
       case 'running':
       case 'revising':
-        return 'border-indigo-500 ring-4 ring-indigo-500/20';
+        return 'border-indigo-500 bg-indigo-50 ring-4 ring-indigo-500/20';
       case 'failed':
       case 'interrupted':
-        return 'border-rose-500 ring-4 ring-rose-500/20';
+        return 'border-rose-500 bg-rose-50 ring-4 ring-rose-500/20';
       case 'waiting_review':
       case 'waiting_input':
-        return 'border-amber-500 ring-4 ring-amber-400/40';
+        return 'border-amber-500 bg-amber-50 ring-4 ring-amber-400/40';
       case 'ready':
-        return 'border-yellow-500 ring-2 ring-yellow-400/30';
+        return 'border-yellow-500 bg-yellow-50 ring-2 ring-yellow-400/30';
       default:
-        return 'border-slate-300 opacity-80';
+        return 'border-slate-300 bg-slate-50 opacity-80';
     }
   };
 
   const renderLayoutNodes = (
     layoutNode: ElkLayoutNode,
+    mode: 'background' | 'nodes',
     offsetX = 0,
     offsetY = 0
   ): React.ReactElement[] => {
-    return (layoutNode.children || [])
-      .map((child) => {
-        const dataNode = nodes.find((n) => n.id === child.id);
-        const isLoop = !dataNode;
+    const elements: React.ReactElement[] = [];
 
-        const absX = offsetX + (child.x || 0);
-        const absY = offsetY + (child.y || 0);
+    (layoutNode.children || []).forEach((child) => {
+      const dataNode = nodes.find((n) => n.id === child.id);
+      const isLoop = !dataNode;
 
-        if (isLoop) {
+      const absX = offsetX + (child.x || 0);
+      const absY = offsetY + (child.y || 0);
+
+      if (isLoop) {
+        if (mode === 'background') {
           const loopData = loops.find((l) => l.loop_key === child.id);
           const loopStatus = loopData?.status ?? null;
           const loopTone = workflowLoopStatusMeta(loopStatus);
 
-          return (
-            <div key={child.id}>
+          elements.push(
+            <div key={`loop-bg-${child.id}`}>
               <div
-                className="absolute border border-dashed rounded-2xl pointer-events-none"
+                className="absolute border-2 border-dashed rounded-[32px] pointer-events-none transition-all duration-500"
                 style={{
                   left: absX,
                   top: absY,
                   width: child.width,
                   height: child.height,
                   borderColor: loopTone.borderColor,
-                  backgroundColor: 'rgba(241,245,249,0.3)',
+                  backgroundColor: '#FFFFFF',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.03), inset 0 2px 20px 0 rgba(0,0,0,0.01)',
                 }}
               >
-                <div className="absolute top-0 left-0 bg-slate-200 text-slate-600 px-3 py-1 rounded-br-2xl rounded-tl-2xl text-[10px] font-bold tracking-widest uppercase shadow-sm flex items-center gap-1.5">
-                  <span>{child.id}</span>
+                {/* Floating Header Badge */}
+                <div 
+                  className="absolute -top-3 left-6 flex items-center gap-2 px-3 py-1.5 rounded-full bg-white border border-slate-200 shadow-sm"
+                  style={{ borderColor: loopTone.borderColor }}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <ArrowsClockwiseIcon className="size-3 text-slate-400" weight="bold" />
+                    <span className="text-[10px] font-bold tracking-tight text-slate-800 uppercase">{child.id}</span>
+                  </div>
+                  <div className="w-px h-3 bg-slate-200 mx-0.5" />
                   <span
                     className={cn(
-                      'rounded-full border px-2 py-0.5 text-[9px]',
+                      'rounded-full px-2 py-0.5 text-[9px] font-bold whitespace-nowrap',
                       loopTone.badgeClass
                     )}
                   >
                     {loopTone.label}
                   </span>
                   {loopStatus === 'running' && (
-                    <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                    </span>
                   )}
                 </div>
               </div>
-              {renderLayoutNodes(child, absX, absY)}
+              {renderLayoutNodes(child, 'background', absX, absY)}
             </div>
           );
+        } else {
+          elements.push(...renderLayoutNodes(child, 'nodes', absX, absY));
         }
+        return;
+      }
 
+      if (mode === 'nodes') {
         const step = stepByKey.get(child.id);
         const status = step?.status ?? dataNode.data.status ?? 'pending';
         const retryStepId = step?.id ?? null;
@@ -664,11 +674,11 @@ export function WorkflowGraphBoard({
             : null) ??
           'Lead';
 
-        return (
+        elements.push(
           <div
             key={child.id}
             className={cn(
-              'absolute bg-white rounded-xl p-4 flex flex-col gap-2',
+              'absolute rounded-xl p-4 flex flex-col gap-2',
               'border-2 shadow-sm cursor-pointer',
               'transition-all duration-200 hover:-translate-y-1 hover:shadow-md',
               getStatusNodeStyles(status),
@@ -718,9 +728,6 @@ export function WorkflowGraphBoard({
             <div className="text-sm font-bold text-slate-900 leading-tight mt-1 truncate">
               {step?.title ?? dataNode.data.title}
             </div>
-            <p className="text-[11px] text-slate-500 leading-snug line-clamp-2 mt-auto">
-              {step?.summary_text ?? ''}
-            </p>
 
             {status === 'running' && (
               <div className="absolute -bottom-1 -left-0.5 -right-0.5 h-1.5 bg-indigo-100 rounded-b-xl overflow-hidden">
@@ -758,8 +765,10 @@ export function WorkflowGraphBoard({
             )}
           </div>
         );
-      })
-      .filter(Boolean) as React.ReactElement[];
+      }
+    });
+
+    return elements.filter(Boolean);
   };
 
   if (!layout && nodes.length === 0) return null;
@@ -768,9 +777,7 @@ export function WorkflowGraphBoard({
     <div
       className={cn(
         'relative overflow-hidden',
-        isFullscreen
-          ? 'fixed inset-3 z-[80] rounded-[28px] shadow-[0_30px_100px_rgba(15,23,42,0.34)] md:inset-6 bg-slate-100'
-          : 'rounded-[28px]',
+        'rounded-[28px]',
         className
       )}
       ref={containerRef}
@@ -781,12 +788,11 @@ export function WorkflowGraphBoard({
       onContextMenu={(e) => e.preventDefault()}
       style={{
         touchAction: 'none',
-        backgroundImage: `url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCI+CjxjaXJjbGUgY3g9IjEiIGN5PSIxIiByPSIxIiBmaWxsPSIjQ0JENUUxIi8+Cjwvc3ZnPg==')`,
-        minHeight: isFullscreen ? undefined : 480,
-        height: isFullscreen ? '100%' : undefined,
+        backgroundColor: '#F1F5F9',
+        minHeight: 480,
       }}
     >
-      <div className="absolute top-4 left-4 pointer-events-none z-10 text-xs text-slate-400 font-medium flex flex-col gap-1">
+      <div className="absolute top-4 left-4 pointer-events-none z-10 text-xs text-slate-600 font-medium flex flex-col gap-1">
         <span>(Tip: 滚轮缩放，右键拖拽平移)</span>
         {layoutError && (
           <span className="text-amber-500 font-semibold pointer-events-auto">
@@ -804,18 +810,6 @@ export function WorkflowGraphBoard({
         >
           <ArrowsInSimpleIcon className="size-4" weight="bold" />
         </button>
-        <button
-          type="button"
-          onClick={() => setIsFullscreen((v) => !v)}
-          className="p-2.5 bg-white text-slate-600 rounded-full shadow-md border border-slate-200 hover:bg-slate-50 hover:text-slate-900 transition-colors"
-          title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
-        >
-          {isFullscreen ? (
-            <ArrowsInSimpleIcon className="size-4" weight="bold" />
-          ) : (
-            <ArrowsOutSimpleIcon className="size-4" weight="bold" />
-          )}
-        </button>
       </div>
 
       <div
@@ -826,6 +820,7 @@ export function WorkflowGraphBoard({
       >
         {layout && (
           <>
+            {renderLayoutNodes(layout, 'background')}
             <svg
               className="absolute inset-0 pointer-events-none overflow-visible z-0"
               style={{
@@ -859,7 +854,7 @@ export function WorkflowGraphBoard({
               </defs>
               {flattenEdges(layout, edges, hoveredNodeId)}
             </svg>
-            {renderLayoutNodes(layout)}
+            {renderLayoutNodes(layout, 'nodes')}
           </>
         )}
       </div>

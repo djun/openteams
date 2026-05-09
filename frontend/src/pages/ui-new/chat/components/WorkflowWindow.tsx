@@ -15,10 +15,11 @@ import {
   Loader2,
   MessageSquare,
   FileText,
-  Activity,
+  ScrollText,
   Bot,
   RotateCcw,
   Ban,
+  type LucideIcon,
 } from 'lucide-react';
 import type { WorkflowCardData } from '@/lib/api';
 import { chatApi } from '@/lib/api';
@@ -29,7 +30,6 @@ import { WorkflowGraphBoard } from './WorkflowGraphBoard';
 import {
   workflowLatestReviewFeedback,
   workflowLatestReviewLabel,
-  workflowLoopStatusMeta,
   workflowReviewPhaseMeta,
   workflowStatusLabel,
 } from './workflowStepPresentation';
@@ -74,6 +74,8 @@ type WorkflowRuntimeMessage = {
   content: string;
   createdAt: string;
 };
+
+type ExecutionRecordTab = 'DETAILS' | 'LOGS';
 
 type WorkflowTranscriptSummaryPayload = {
   summary?: string;
@@ -171,6 +173,81 @@ function getTranscriptMarkdown(entry: WorkflowTranscriptEntry): string | null {
   return null;
 }
 
+function getTranscriptMetaSource(entry: WorkflowTranscriptEntry): string | null {
+  if (!entry.meta_json) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(entry.meta_json) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    const source = (parsed as Record<string, unknown>).source;
+    return typeof source === 'string' ? source : null;
+  } catch {
+    return null;
+  }
+}
+
+function isWorkflowCardStepContentEntry(entry: WorkflowTranscriptEntry): boolean {
+  return getTranscriptMetaSource(entry) === 'workflow_card_step_content';
+}
+
+function isWorkflowRuntimeThinkingEntry(entry: WorkflowTranscriptEntry): boolean {
+  return (
+    entry.entry_type === 'thinking' &&
+    getTranscriptMetaSource(entry) === 'workflow_runtime_stream'
+  );
+}
+
+function getWorkflowOutputEntryLabel(entry: WorkflowTranscriptEntry): string {
+  if (isWorkflowCardStepContentEntry(entry)) {
+    return 'final output';
+  }
+  return entry.entry_type;
+}
+
+function getWorkflowOutputEntryIcon(
+  entry: WorkflowTranscriptEntry
+): LucideIcon {
+  if (isWorkflowCardStepContentEntry(entry) || entry.entry_type === 'output') {
+    return FileText;
+  }
+  if (entry.entry_type === 'error') {
+    return AlertCircle;
+  }
+  if (entry.message_type === 'agent') {
+    return Bot;
+  }
+  if (entry.message_type === 'user') {
+    return Send;
+  }
+  if (entry.message_type === 'system' || entry.message_type === 'control') {
+    return ScrollText;
+  }
+  return MessageSquare;
+}
+
+function getWorkflowOutputEntryIconClass(entry: WorkflowTranscriptEntry): string {
+  if (isWorkflowCardStepContentEntry(entry) || entry.entry_type === 'output') {
+    return 'bg-blue-50 text-blue-600 border-blue-100';
+  }
+  if (entry.entry_type === 'error') {
+    return 'bg-red-50 text-red-600 border-red-100';
+  }
+  if (entry.message_type === 'agent') {
+    return 'bg-indigo-50 text-indigo-600 border-indigo-100';
+  }
+  if (entry.message_type === 'user') {
+    return 'bg-emerald-50 text-emerald-600 border-emerald-100';
+  }
+  if (entry.message_type === 'system' || entry.message_type === 'control') {
+    return 'bg-amber-50 text-amber-600 border-amber-100';
+  }
+  return 'bg-slate-50 text-slate-500 border-slate-200';
+}
+
 function hasAgentTranscriptMessageForStep(
   entries: WorkflowTranscriptEntry[],
   stepId?: string | null,
@@ -233,7 +310,7 @@ function buildStepContentTranscriptEntries(
         workflow_agent_session_id: resolveStepAgentSessionId(step),
         agent_name: step.agent_name,
         message_type: 'agent' as const,
-        entry_type: 'message',
+        entry_type: 'output',
         content: step.content!.trim(),
         meta_json: JSON.stringify({
           source: 'workflow_card_step_content',
@@ -499,7 +576,6 @@ function InspectorCard({
   reviewPhase,
   latestReviewLabel,
   latestReviewFeedback,
-  loopTone,
   onClose,
   onOpenChat,
   isChatVisible,
@@ -509,6 +585,8 @@ function InspectorCard({
   pendingActionId,
   transcriptEntries,
   isLoadingTranscript,
+  activeTab,
+  onActiveTabChange,
 }: {
   step: WorkflowCardStep;
   planNode: WorkflowCardData['plan']['nodes'][number] | null;
@@ -517,7 +595,6 @@ function InspectorCard({
   reviewPhase: ReturnType<typeof workflowReviewPhaseMeta>;
   latestReviewLabel: string | null;
   latestReviewFeedback: string | null;
-  loopTone: ReturnType<typeof workflowLoopStatusMeta>;
   onClose: () => void;
   onOpenChat: () => void;
   isChatVisible: boolean;
@@ -527,9 +604,16 @@ function InspectorCard({
   pendingActionId?: string | null;
   transcriptEntries: WorkflowTranscriptEntry[];
   isLoadingTranscript: boolean;
+  activeTab: ExecutionRecordTab;
+  onActiveTabChange: (tab: ExecutionRecordTab) => void;
 }) {
   const { t } = useTranslation('chat');
-  const [activeTab, setActiveTab] = useState<'STREAM' | 'OUTPUT'>('STREAM');
+  const [expandedLogLines, setExpandedLogLines] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [collapsedLogGroups, setCollapsedLogGroups] = useState<Set<string>>(
+    () => new Set()
+  );
 
   const statusColors: Record<string, string> = {
     failed: 'bg-rose-50 text-rose-600 border-rose-200',
@@ -549,8 +633,17 @@ function InspectorCard({
   const summaryText =
     step.summary_text?.trim() ||
     'No summary has been generated for this step yet.';
+  const loopName = loop?.loop_key?.trim() ?? '';
+  const loopRejectionReason = loop?.rejection_reason?.trim() ?? '';
   const isFailed = WORKFLOW_FAILURE_STEP_STATUSES.has(step.status);
   const isCompleted = step.status === 'completed';
+  const hasError = isFailed || loopRejectionReason.length > 0;
+  const stepMetaItems = [
+    `Agent:${agentName}`,
+    `Node Type:${step.step_type}`,
+    loopName ? `Loop ID:${loopName}` : null,
+    reviewPhase ? `Review:${reviewPhase.label}` : null,
+  ].filter((item): item is string => Boolean(item));
   const hasFooterActions =
     step.status === 'running' ||
     step.status === 'waiting_review' ||
@@ -559,24 +652,87 @@ function InspectorCard({
 
   const streamEntries = useMemo(
     () =>
-      transcriptEntries.filter(
-        (e) =>
-          e.entry_type === 'message' ||
-          e.entry_type === 'error' ||
-          e.entry_type === 'thinking'
-      ),
+      transcriptEntries.filter((entry) => isWorkflowRuntimeThinkingEntry(entry)),
     [transcriptEntries]
+  );
+  const formatLogTimestamp = (createdAt: string) => {
+    const date = new Date(createdAt);
+    if (Number.isNaN(date.getTime())) return '--:--:--.---';
+    return date.toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      fractionalSecondDigits: 3,
+    });
+  };
+  const agentLogGroups = useMemo(
+    () =>
+      Array.from(
+        streamEntries.reduce((groups, entry) => {
+          const groupAgentName = entry.agent_name?.trim() || agentName;
+          const groupKey = `${step.id}::${groupAgentName}`;
+          const existing = groups.get(groupKey);
+          const content = (getTranscriptMarkdown(entry) ?? entry.content).trim();
+          if (!content) return groups;
+          const lines = content
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line, index) => ({
+              key: `${entry.id}-${index}`,
+              timestamp: formatLogTimestamp(entry.created_at),
+              content: line,
+              isError: /error|failed|fatal|exception/i.test(line),
+            }));
+          if (lines.length === 0) return groups;
+          if (existing) {
+            existing.lines.push(...lines);
+          } else {
+            groups.set(groupKey, {
+              key: groupKey,
+              agentName: groupAgentName,
+              lines,
+            });
+          }
+          return groups;
+        }, new Map<string, { key: string; agentName: string; lines: Array<{ key: string; timestamp: string; content: string; isError: boolean }> }>())
+          .values()
+      ),
+    [agentName, step.id, streamEntries]
   );
   const outputEntries = useMemo(
     () =>
       transcriptEntries.filter(
-        (e) =>
-          e.entry_type === 'summary' ||
-          e.entry_type === 'output' ||
-          e.entry_type === 'final_review'
+        (entry) => !isWorkflowRuntimeThinkingEntry(entry)
       ),
     [transcriptEntries]
   );
+  const toggleLogLine = (lineKey: string) => {
+    setExpandedLogLines((current) => {
+      const next = new Set(current);
+      if (next.has(lineKey)) next.delete(lineKey);
+      else next.add(lineKey);
+      return next;
+    });
+  };
+  const toggleLogGroupVisibility = (groupKey: string, lineKeys: string[]) => {
+    const wasCollapsed = collapsedLogGroups.has(groupKey);
+    setCollapsedLogGroups((current) => {
+      const next = new Set(current);
+      if (wasCollapsed) next.delete(groupKey);
+      else next.add(groupKey);
+      return next;
+    });
+    setExpandedLogLines((lines) => {
+      const expanded = new Set(lines);
+      for (const key of lineKeys) {
+        if (wasCollapsed) expanded.add(key);
+        else expanded.delete(key);
+      }
+      return expanded;
+    });
+  };
 
   return (
     <motion.div
@@ -584,270 +740,116 @@ function InspectorCard({
       animate={{ x: 0, opacity: 1 }}
       exit={{ x: 60, opacity: 0 }}
       transition={{ type: 'spring', stiffness: 300, damping: 30 }}
-      className="w-[500px] h-[calc(100vh-40px)] max-h-[900px] mr-5 bg-white shadow-2xl rounded-3xl border border-slate-200 flex flex-col relative overflow-hidden"
+      className="w-[28vw] min-w-[420px] max-w-[720px] h-[92vh] max-h-[960px] mr-5 bg-white shadow-2xl rounded-none border border-gray-300 flex flex-col relative overflow-hidden"
     >
       <button
         type="button"
         onClick={onClose}
-        className="absolute top-4 right-4 p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-colors z-20"
+        className="absolute top-2.5 right-3 p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors z-20"
       >
         <X className="w-5 h-5" />
       </button>
 
-      {/* Header */}
-      <header className="px-6 pt-5 pb-4 shrink-0 bg-white border-b border-slate-100 z-10 relative">
-        <div className="flex items-center gap-3 pr-8">
-          <h1 className="text-lg font-bold text-slate-800 m-0 leading-snug truncate">
-            {step.title}
-          </h1>
+      <div className="flex items-center border-b border-gray-200 bg-gray-50 p-0 select-none shrink-0">
+        <button
+          type="button"
+          onClick={() => onActiveTabChange('DETAILS')}
+          className={cn(
+            'inline-flex items-center gap-2 px-4 py-2 text-sm font-medium border-r border-gray-200 border-t-2 transition-colors',
+            activeTab === 'DETAILS'
+              ? 'bg-white text-gray-900 border-b-0 border-t-slate-800'
+              : 'text-gray-500 bg-gray-50 hover:bg-gray-100 border-b border-b-gray-200 border-t-transparent'
+          )}
+        >
+          <FileText className="h-4 w-4" />
+          Details
+        </button>
+        <button
+          type="button"
+          onClick={() => onActiveTabChange('LOGS')}
+          className={cn(
+            'inline-flex items-center gap-2 px-4 py-2 text-sm font-medium border-r border-gray-200 border-t-2 transition-colors',
+            activeTab === 'LOGS'
+              ? 'bg-white text-gray-900 border-b-0 border-t-slate-800'
+              : 'text-gray-500 bg-gray-50 hover:bg-gray-100 border-b border-b-gray-200 border-t-transparent'
+          )}
+        >
+          <ScrollText className="h-4 w-4" />
+          Logs
+        </button>
+        <div className="flex-grow flex justify-end pr-14 border-b border-gray-200 h-full py-2">
           <span
             className={cn(
-              'shrink-0 px-2 py-0.5 rounded flex items-center justify-center text-[10px] font-bold tracking-wider uppercase border',
-              statusColors[step.status] ?? statusColors.pending
+              'inline-flex items-center px-2.5 py-0.5 text-xs font-semibold border uppercase tracking-wide',
+              hasError
+                ? 'bg-red-50 text-red-700 border-red-200'
+                : statusColors[step.status] ?? statusColors.pending
             )}
           >
             {workflowStatusLabel(step.status)}
           </span>
         </div>
-        <div className="mt-1.5 flex items-center gap-1.5 text-xs text-slate-500">
-          <Bot className="w-3.5 h-3.5 text-slate-400" />
-          <span>
-            {step.step_type} |{' '}
-            <span className="font-semibold text-slate-700">{agentName}</span>
-          </span>
-        </div>
-        {reviewPhase && (
-          <span
-            className={cn(
-              'mt-2 inline-flex rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider',
-              reviewPhase.badgeClass
-            )}
-          >
-            {reviewPhase.label}
-          </span>
-        )}
-      </header>
+      </div>
 
-      {/* Body */}
-      <div className="flex-1 overflow-y-auto p-6 bg-slate-50/50 flex flex-col gap-6">
-        {/* Task Instruction */}
-        <section>
-          <div className="flex items-center gap-2 mb-2">
-            <FileText className="w-4 h-4 text-slate-400" />
-            <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+      <div className="flex-1 overflow-hidden relative">
+        {activeTab === 'DETAILS' ? (
+          <div className="absolute inset-0 p-8 overflow-y-auto bg-white">
+            <h2 className="text-xl font-semibold mb-3 pb-1 border-b border-gray-200 text-gray-900">
+              {step.title}
+            </h2>
+
+            <div className="mb-6 mt-3 overflow-hidden text-ellipsis whitespace-nowrap bg-slate-50 p-3 font-mono text-xs text-slate-800 border border-slate-200">
+              {stepMetaItems.map((item, index) => (
+                <span key={item}>
+                  {index > 0 && (
+                    <span className="mx-2 text-slate-400">&middot;</span>
+                  )}
+                  {item}
+                </span>
+              ))}
+            </div>
+
+            <h3 className="text-base font-semibold mb-2 mt-5 text-gray-700">
               Instruction
             </h3>
-          </div>
-          <div className="p-4 rounded-xl text-sm leading-relaxed bg-white border border-slate-200 text-slate-700 shadow-sm whitespace-pre-wrap">
-            {instruction}
-          </div>
-        </section>
+            <blockquote className="border-l-4 border-slate-300 bg-slate-50 px-4 py-2 text-sm leading-relaxed text-slate-600 mb-5 whitespace-pre-wrap">
+              {instruction}
+            </blockquote>
 
-        {/* Summary & Feedback */}
-        {(isFailed || isCompleted || latestReviewFeedback) && (
-          <section>
-            <div className="flex items-center gap-2 mb-2">
-              <AlertCircle className="w-4 h-4 text-slate-400" />
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-                Summary & Feedback
-              </h3>
-            </div>
-            <div className="flex flex-col gap-3">
-              {isFailed && (
-                <div className="p-4 rounded-xl text-sm font-medium bg-rose-50 border border-rose-100 text-rose-700 shadow-sm whitespace-pre-wrap">
-                  {summaryText}
+            <h3 className="text-base font-semibold mb-2 mt-5 text-gray-700">
+              Execution Record Output
+            </h3>
+            <div className="mb-5 text-sm text-slate-600 leading-6">
+              {isLoadingTranscript ? (
+                <div className="flex items-center gap-2 text-xs text-slate-400">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Loading transcript...
                 </div>
-              )}
-              {isCompleted && (
-                <div className="p-4 rounded-xl text-sm font-medium bg-emerald-50 border border-emerald-100 text-emerald-700 shadow-sm whitespace-pre-wrap">
-                  {summaryText}
-                </div>
-              )}
-              {latestReviewLabel && (
-                <div className="p-4 rounded-xl text-sm bg-amber-50/80 border border-amber-200 text-amber-800 shadow-sm">
-                  <strong className="block mb-1 font-semibold">
-                    {latestReviewLabel}
-                  </strong>
-                  {latestReviewFeedback && (
-                    <span className="whitespace-pre-wrap">
-                      {latestReviewFeedback}
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
-          </section>
-        )}
-
-        {/* Loop Context */}
-        {loop && (
-          <section>
-            <div className="flex items-center gap-2 mb-2">
-              <Activity className="w-4 h-4 text-slate-400" />
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-                Loop Context
-              </h3>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-700">
-                {loop.loop_key}
-              </span>
-              <span
-                className={cn(
-                  'rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider',
-                  loopTone.badgeClass
-                )}
-              >
-                {loopTone.label}
-              </span>
-            </div>
-            {loop.rejection_reason?.trim() && (
-              <div
-                className={cn(
-                  'mt-2 text-xs leading-5 whitespace-pre-wrap',
-                  loopTone.textClass
-                )}
-              >
-                {loop.rejection_reason.trim()}
-              </div>
-            )}
-          </section>
-        )}
-
-        {/* Execution Record */}
-        <section className="flex-1 flex flex-col min-h-[250px]">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-slate-400" />
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-                Execution Record
-              </h3>
-            </div>
-            <div className="flex bg-slate-200/60 p-0.5 rounded-lg border border-slate-200/60 shadow-inner">
-              <button
-                type="button"
-                onClick={() => setActiveTab('STREAM')}
-                className={cn(
-                  'px-3 py-1.5 text-[10px] uppercase tracking-[1px] font-bold rounded-md transition-all',
-                  activeTab === 'STREAM'
-                    ? 'bg-white text-slate-700 shadow-sm'
-                    : 'text-slate-500 hover:text-slate-700'
-                )}
-              >
-                Stream
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab('OUTPUT')}
-                className={cn(
-                  'px-3 py-1.5 text-[10px] uppercase tracking-[1px] font-bold rounded-md transition-all',
-                  activeTab === 'OUTPUT'
-                    ? 'bg-white text-slate-700 shadow-sm'
-                    : 'text-slate-500 hover:text-slate-700'
-                )}
-              >
-                Output
-              </button>
-            </div>
-          </div>
-
-          <div className="flex-1 bg-white border border-slate-200 rounded-xl p-4 shadow-sm overflow-y-auto flex flex-col">
-            {isLoadingTranscript ? (
-              <div className="flex items-center justify-center gap-2 py-8 text-xs text-slate-400">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Loading transcript...
-              </div>
-            ) : activeTab === 'STREAM' ? (
-              streamEntries.length > 0 ? (
-                <div className="flex flex-col gap-4">
-                  {streamEntries.map((entry) => {
+              ) : outputEntries.length > 0 ? (
+                <div className="space-y-5">
+                  {outputEntries.map((entry) => {
                     const markdownContent = getTranscriptMarkdown(entry);
-                    const isError = entry.entry_type === 'error';
+                    const OutputIcon = getWorkflowOutputEntryIcon(entry);
+                    const outputAgentName =
+                      entry.entry_type === 'message'
+                        ? entry.agent_name?.trim()
+                        : null;
+                    const outputLabel =
+                      outputAgentName || getWorkflowOutputEntryLabel(entry);
                     return (
-                      <div key={entry.id} className="flex gap-3 items-start">
-                        <div
-                          className={cn(
-                            'w-7 h-7 shrink-0 rounded-lg flex items-center justify-center text-[11px] font-bold',
-                            entry.message_type === 'agent'
-                              ? 'bg-slate-800 text-white'
-                              : isError
-                                ? 'bg-rose-50 border border-rose-100 text-rose-600'
-                                : 'bg-indigo-50 border border-indigo-100 text-indigo-600'
-                          )}
-                        >
-                          {entry.message_type === 'agent'
-                            ? 'A'
-                            : isError
-                              ? '!'
-                              : 'S'}
+                      <div key={entry.id}>
+                        <div className="mb-2 inline-flex items-center gap-2 text-xs font-semibold text-slate-500">
+                          <span
+                            className={cn(
+                              'inline-flex h-6 w-6 items-center justify-center border',
+                              getWorkflowOutputEntryIconClass(entry)
+                            )}
+                          >
+                            <OutputIcon className="h-3.5 w-3.5" />
+                          </span>
+                          {outputLabel}
                         </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 mb-1">
-                            <span
-                              className={cn(
-                                'text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded',
-                                isError
-                                  ? 'text-rose-600 bg-rose-50'
-                                  : entry.message_type === 'agent'
-                                    ? 'text-slate-600 bg-slate-100'
-                                    : 'text-indigo-600 bg-indigo-50'
-                              )}
-                            >
-                              {entry.agent_name ?? entry.message_type}
-                            </span>
-                          </div>
-                          {markdownContent ? (
-                            <ChatMarkdown
-                              content={markdownContent}
-                              maxWidth="100%"
-                              hideCopyButton
-                              textClassName={cn(
-                                'text-[13px] leading-relaxed',
-                                isError
-                                  ? 'text-rose-600'
-                                  : 'text-slate-700'
-                              )}
-                              className="w-full select-text"
-                            />
-                          ) : (
-                            <div
-                              className={cn(
-                                'text-[13px] leading-relaxed whitespace-pre-wrap select-text',
-                                isError ? 'text-rose-600' : 'text-slate-700'
-                              )}
-                            >
-                              {entry.content}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                  {step.status === 'running' && (
-                    <div className="flex items-center gap-2 text-slate-400 text-xs font-medium pl-10 animate-pulse py-2">
-                      Waiting for agent response...
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="flex items-center justify-center py-8 text-xs text-slate-400">
-                  No stream messages for this step yet.
-                </div>
-              )
-            ) : outputEntries.length > 0 ? (
-              <div className="flex flex-col gap-6">
-                {outputEntries.map((entry) => {
-                  const markdownContent = getTranscriptMarkdown(entry);
-                  return (
-                    <div key={entry.id}>
-                      <div className="flex items-center gap-3 mb-3">
-                        <div className="w-1.5 h-6 bg-blue-500 rounded-full shrink-0" />
-                        <div className="bg-blue-50 text-blue-600 px-3 py-1.5 rounded-full text-xs font-bold tracking-wider uppercase">
-                          {entry.entry_type}
-                        </div>
-                      </div>
-                      {markdownContent ? (
-                        <div className="pl-4">
+                        {markdownContent ? (
                           <ChatMarkdown
                             content={markdownContent}
                             maxWidth="100%"
@@ -855,23 +857,149 @@ function InspectorCard({
                             textClassName="text-[13px] text-slate-700 leading-relaxed"
                             className="w-full select-text"
                           />
-                        </div>
-                      ) : (
-                        <div className="pl-4 text-[13px] text-slate-700 leading-relaxed whitespace-pre-wrap select-text">
-                          {entry.content}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+                        ) : (
+                          <pre className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-slate-700 select-text">
+                            {entry.content}
+                          </pre>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-400">
+                  No output entries for this step yet.
+                </div>
+              )}
+            </div>
+
+            {hasError && (
+              <>
+                <h3 className="text-base font-semibold mb-2 mt-5 text-red-600">
+                  Error
+                </h3>
+                <pre className="border border-red-300 bg-red-50 p-4 mb-5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-red-700">
+                  {loopRejectionReason || summaryText}
+                </pre>
+              </>
+            )}
+
+            {(isFailed || isCompleted) && (
+              <>
+                <h3 className="text-base font-semibold mb-2 mt-5 text-gray-700">
+                  Summary
+                </h3>
+                <ChatMarkdown
+                  content={summaryText}
+                  maxWidth="100%"
+                  hideCopyButton
+                  textClassName="text-[13px] text-slate-700 leading-relaxed"
+                  className="mb-5 w-full select-text"
+                />
+              </>
+            )}
+
+            {latestReviewLabel && (
+              <>
+                <h3 className="text-base font-semibold mb-2 mt-5 text-gray-700">
+                  Feedback
+                </h3>
+                <ChatMarkdown
+                  content={latestReviewFeedback || latestReviewLabel}
+                  maxWidth="100%"
+                  hideCopyButton
+                  textClassName="text-[13px] text-slate-700 leading-relaxed"
+                  className="mb-5 w-full select-text"
+                />
+              </>
+            )}
+          </div>
+        ) : (
+          <div className="absolute inset-0 bg-slate-900 text-slate-300 flex flex-col">
+            {isLoadingTranscript ? (
+              <div className="flex items-center justify-center gap-2 py-8 text-xs text-slate-500">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Loading logs...
               </div>
+            ) : agentLogGroups.length > 0 ? (
+              agentLogGroups.map((group, groupIndex) => {
+                const groupLineKeys = group.lines.map((line) => line.key);
+                const allExpanded = groupLineKeys.every((key) =>
+                  expandedLogLines.has(key)
+                );
+                const isGroupCollapsed = collapsedLogGroups.has(group.key);
+                return (
+                  <div
+                    key={group.key}
+                    className={cn(
+                      'overflow-y-auto flex flex-col',
+                      isGroupCollapsed
+                        ? 'shrink-0'
+                        : 'flex-1 min-h-[50%]',
+                      groupIndex < agentLogGroups.length - 1 &&
+                        'border-b border-slate-700'
+                    )}
+                  >
+                    <div className="sticky top-0 bg-slate-900/95 backdrop-blur-sm border-b border-slate-800 p-3 px-5 text-xs text-slate-500 font-mono flex justify-between items-center z-10">
+                      <span className="inline-flex min-w-0 items-center gap-2">
+                        <Bot className="h-4 w-4 shrink-0 text-slate-400" />
+                        <span className="truncate">
+                          {group.agentName} - Thinking Process
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors"
+                        onClick={() =>
+                          toggleLogGroupVisibility(group.key, groupLineKeys)
+                        }
+                      >
+                        {isGroupCollapsed || !allExpanded
+                          ? 'Expand All'
+                          : 'Collapse All'}
+                      </button>
+                    </div>
+                    {!isGroupCollapsed && (
+                      <div className="flex flex-col font-mono p-4 pb-8">
+                        {group.lines.map((line) => {
+                          const expanded = expandedLogLines.has(line.key);
+                          return (
+                            <div
+                              key={line.key}
+                              className="flex items-start px-2 py-0.5 text-[12px] text-slate-300 hover:bg-slate-800"
+                            >
+                              <span className="mr-4 shrink-0 select-none text-slate-500">
+                                [{line.timestamp}]
+                              </span>
+                              <button
+                                type="button"
+                                title={line.content}
+                                onClick={() => toggleLogLine(line.key)}
+                                className={cn(
+                                  'flex-1 text-left overflow-hidden text-ellipsis',
+                                  expanded
+                                    ? 'whitespace-pre-wrap break-all'
+                                    : 'whitespace-nowrap',
+                                  line.isError && 'text-red-400'
+                                )}
+                              >
+                                {line.content}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
             ) : (
-              <div className="flex items-center justify-center py-8 text-xs text-slate-400">
-                No output entries for this step yet.
+              <div className="flex items-center justify-center py-8 text-xs text-slate-500">
+                No logs for this step yet.
               </div>
             )}
           </div>
-        </section>
+        )}
       </div>
 
       {/* Footer */}
@@ -960,11 +1088,16 @@ function ChatPanel({
   const [inputText, setInputText] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  const outputEntries = useMemo(
+    () => entries.filter((e) => e.entry_type === 'message'),
+    [entries]
+  );
+
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [entries.length]);
+  }, [outputEntries.length]);
 
   const handleSend = () => {
     const trimmed = inputText.trim();
@@ -974,7 +1107,7 @@ function ChatPanel({
   };
 
   return (
-    <div className="w-[320px] bg-[#F8FAFC] h-full border-l border-slate-200 flex flex-col shadow-2xl">
+    <div className="w-[24vw] min-w-[320px] max-w-[480px] bg-[#F8FAFC] h-[92vh] max-h-[960px] border-l border-slate-200 flex flex-col shadow-2xl">
       <div className="p-4 border-b border-slate-200 bg-white flex items-center gap-3 shrink-0">
         <div className="w-8 h-8 rounded-full bg-indigo-500 flex items-center justify-center text-white text-xs font-bold shadow-sm">
           {agentName.substring(0, 2).toUpperCase()}
@@ -1003,9 +1136,13 @@ function ChatPanel({
         ref={scrollRef}
         className="flex-1 p-4 space-y-4 overflow-y-auto flex flex-col py-6"
       >
-        {entries.map((entry) => {
+        {outputEntries.map((entry) => {
           const isUser = entry.message_type === 'user';
           const markdownContent = getTranscriptMarkdown(entry);
+          const entryAgentName =
+            !isUser && entry.agent_name?.trim()
+              ? entry.agent_name.trim()
+              : null;
 
           if (
             entry.entry_type === 'approval_request' ||
@@ -1081,6 +1218,16 @@ function ChatPanel({
               key={entry.id}
               className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
             >
+              {!isUser && entryAgentName && (
+                <div className="flex items-center gap-1.5 mb-1">
+                  <div className="w-4 h-4 rounded-full bg-slate-200 flex items-center justify-center text-[8px] font-bold text-slate-600 shrink-0">
+                    {entryAgentName.substring(0, 2).toUpperCase()}
+                  </div>
+                  <span className="text-[10px] font-semibold text-slate-500">
+                    {entryAgentName}
+                  </span>
+                </div>
+              )}
               <div
                 className={cn(
                   'text-xs leading-relaxed',
@@ -1151,6 +1298,7 @@ export function WorkflowWindow({
   sessionId,
   projection,
   transcript = [],
+  runtimeMessages = [],
   isOpen,
   onClose,
   onExecute,
@@ -1168,6 +1316,8 @@ export function WorkflowWindow({
 }: WorkflowWindowProps) {
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
   const [isChatVisible, setIsChatVisible] = useState(false);
+  const [executionRecordTab, setExecutionRecordTab] =
+    useState<ExecutionRecordTab>('DETAILS');
   const [runtimeInputTranscripts, setRuntimeInputTranscripts] = useState<
     WorkflowTranscriptEntry[]
   >([]);
@@ -1294,6 +1444,7 @@ export function WorkflowWindow({
       initializedWorkflowKeyRef.current = workflowInstanceKey;
       setActiveNodeId(null);
       setIsChatVisible(false);
+      setExecutionRecordTab('DETAILS');
     }
   }, [isOpen, workflowInstanceKey]);
 
@@ -1325,6 +1476,7 @@ export function WorkflowWindow({
     if (!isOpen) {
       setActiveNodeId(null);
       setIsChatVisible(false);
+      setExecutionRecordTab('DETAILS');
     }
   }, [isOpen]);
 
@@ -1351,7 +1503,6 @@ export function WorkflowWindow({
   const activeStepLoop = activeStep?.loop_key
     ? (loopByKey.get(activeStep.loop_key) ?? null)
     : null;
-  const activeStepLoopTone = workflowLoopStatusMeta(activeStepLoop?.status);
   const activeStepReviewPhase = workflowReviewPhaseMeta(
     activeStep?.review_phase
   );
@@ -1374,7 +1525,7 @@ export function WorkflowWindow({
   // Transcript for inspector card
   const {
     data: activeStepTranscriptData,
-    isFetching: isFetchingActiveStepTranscript,
+    isLoading: isLoadingActiveStepTranscript,
   } = useQuery({
     queryKey: [
       'workflowStepTranscripts',
@@ -1454,9 +1605,44 @@ export function WorkflowWindow({
     transcriptWithLocalInputs,
   ]);
 
+  const activeRuntimeTranscript = useMemo(() => {
+    if (!activeStep || runtimeMessages.length === 0) return [];
+    return runtimeMessages
+      .filter(
+        (message) =>
+          (message.stepId === activeStep.id ||
+            message.stepKey === activeStep.step_key) &&
+          (!activeAgentSessionId ||
+            !message.workflowAgentSessionId ||
+            message.workflowAgentSessionId === activeAgentSessionId)
+      )
+      .map(
+        (message): WorkflowTranscriptEntry => ({
+          id: message.id,
+          step_id: message.stepId,
+          step_key: message.stepKey,
+          workflow_agent_session_id: message.workflowAgentSessionId,
+          agent_name: message.agentName,
+          message_type: 'agent',
+          entry_type:
+            message.streamType === 'assistant'
+              ? 'message'
+              : message.streamType,
+          content: message.content,
+          meta_json: JSON.stringify({
+            source: 'workflow_runtime_stream',
+          }),
+          created_at: message.createdAt,
+        })
+      );
+  }, [activeAgentSessionId, activeStep, runtimeMessages]);
+
   const visibleActiveTranscript =
-    activeStepScopedTranscript.length > 0
-      ? activeStepScopedTranscript
+    activeStepScopedTranscript.length > 0 || activeRuntimeTranscript.length > 0
+      ? mergeAndSortTranscriptEntries(
+          activeStepScopedTranscript,
+          activeRuntimeTranscript
+        )
       : activeStepFallbackTranscript;
 
   // Final review & iteration
@@ -1767,6 +1953,9 @@ export function WorkflowWindow({
             <div className="absolute bottom-6 left-6 z-40 w-80">
               <WorkflowIterationFeedbackCard
                 currentRound={projection.current_round}
+                completedSteps={projection.completed_step_count}
+                totalSteps={projection.total_step_count}
+                runningStepTitle={projection.steps.find((s) => s.status === 'running' || s.status === 'failed')?.title ?? null}
                 iterationHistory={projection.iteration_history}
                 canReviewCurrentRound={canReviewCurrentRound}
                 pendingActionId={pendingActionId}
@@ -1788,6 +1977,15 @@ export function WorkflowWindow({
 
         {/* Side Panels */}
         <div className="absolute top-0 right-0 bottom-0 pointer-events-none flex items-stretch justify-end z-40 overflow-hidden">
+          {activeNodeId && (
+            <div
+              className="fixed inset-0 z-10 pointer-events-auto"
+              onClick={() => {
+                setActiveNodeId(null);
+                setIsChatVisible(false);
+              }}
+            />
+          )}
           {/* Inspector Panel */}
           <AnimatePresence>
             {activeNodeId && activeStep && (
@@ -1801,7 +1999,7 @@ export function WorkflowWindow({
                   duration: 0.3,
                   ease: 'easeInOut',
                 }}
-                className="pointer-events-auto h-full flex items-center shrink-0 z-30"
+                className="pointer-events-auto h-full flex items-center shrink-0 z-30 py-5"
               >
                 <InspectorCard
                   step={activeStep}
@@ -1811,7 +2009,6 @@ export function WorkflowWindow({
                   reviewPhase={activeStepReviewPhase}
                   latestReviewLabel={activeStepLatestReviewLabel}
                   latestReviewFeedback={activeStepLatestReviewFeedback}
-                  loopTone={activeStepLoopTone}
                   onClose={() => {
                     setActiveNodeId(null);
                     setIsChatVisible(false);
@@ -1823,7 +2020,12 @@ export function WorkflowWindow({
                   onRetryStep={onRetryStep}
                   pendingActionId={pendingActionId}
                   transcriptEntries={visibleActiveTranscript}
-                  isLoadingTranscript={isFetchingActiveStepTranscript}
+                  isLoadingTranscript={
+                    isLoadingActiveStepTranscript &&
+                    visibleActiveTranscript.length === 0
+                  }
+                  activeTab={executionRecordTab}
+                  onActiveTabChange={setExecutionRecordTab}
                 />
               </motion.aside>
             )}
@@ -1842,7 +2044,7 @@ export function WorkflowWindow({
                   duration: 0.3,
                   ease: 'easeInOut',
                 }}
-                className="pointer-events-auto h-full shrink-0 z-20"
+                className="pointer-events-auto h-full flex items-center shrink-0 z-20 mr-5 py-5"
               >
                 <ChatPanel
                   step={activeStep}
