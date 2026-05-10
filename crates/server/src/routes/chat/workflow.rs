@@ -14,6 +14,7 @@ use db::models::{
     chat_session::ChatSession,
     chat_session_agent::ChatSessionAgent,
     workflow_execution::WorkflowExecution,
+    workflow_loop::WorkflowLoop,
     workflow_plan::{CreateWorkflowPlan, WorkflowPlan},
     workflow_plan_revision::{CreateWorkflowPlanRevision, WorkflowPlanRevision},
     workflow_step::WorkflowStep,
@@ -29,8 +30,8 @@ use services::services::{
     workflow_compiler::WorkflowCompiler,
     workflow_orchestrator::WorkflowOrchestrator,
     workflow_runtime::{
-        WorkflowCardAgent, build_plan_generation_prompt, extract_json_payload,
-        resolve_workflow_goal, run_workflow_agent_prompt,
+        WorkflowCardAgent, WorkflowCardProjection, build_plan_generation_prompt,
+        extract_json_payload, resolve_workflow_goal, run_workflow_agent_prompt,
     },
     workflow_validator,
 };
@@ -404,6 +405,13 @@ pub struct ExecutePlanRequest {
     pub step_review_overrides: Vec<ExecutePlanReviewOverride>,
 }
 
+#[derive(Debug, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateReviewSettingsRequest {
+    #[serde(default)]
+    pub step_review_overrides: Vec<ExecutePlanReviewOverride>,
+}
+
 pub async fn execute_plan(
     Extension(session): Extension<ChatSession>,
     State(deployment): State<DeploymentImpl>,
@@ -455,6 +463,196 @@ pub async fn execute_plan(
         )),
     )
         .into_response())
+}
+
+pub async fn update_review_settings(
+    Extension(session): Extension<ChatSession>,
+    State(deployment): State<DeploymentImpl>,
+    axum::extract::Path((_session_id, execution_id)): axum::extract::Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateReviewSettingsRequest>,
+) -> Result<ResponseJson<ApiResponse<WorkflowCardProjection>>, ApiError> {
+    let pool = &deployment.db().pool;
+    let overrides = collect_review_override_map(payload.step_review_overrides);
+    if overrides.is_empty() {
+        return Err(ApiError::BadRequest(
+            "At least one review setting is required.".to_string(),
+        ));
+    }
+
+    let execution = WorkflowExecution::find_by_id(pool, execution_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workflow execution not found.".to_string()))?;
+    if execution.session_id != session.id {
+        return Err(ApiError::BadRequest(
+            "Workflow execution not found in this session.".to_string(),
+        ));
+    }
+    if matches!(
+        execution.status,
+        WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
+    ) {
+        return Err(ApiError::BadRequest(
+            "Review settings cannot be changed after execution has finished.".to_string(),
+        ));
+    }
+
+    let active_revision_id = execution.active_revision_id.ok_or_else(|| {
+        ApiError::BadRequest("Workflow execution revision is missing.".to_string())
+    })?;
+    let active_revision = WorkflowPlanRevision::find_by_id(pool, active_revision_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workflow revision not found.".to_string()))?;
+    let plan = WorkflowPlan::find_by_id(pool, execution.plan_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workflow plan not found.".to_string()))?;
+    let mut plan_json: WorkflowPlanJson = serde_json::from_str(&active_revision.plan_json)
+        .map_err(|err| {
+            ApiError::BadRequest(format!(
+                "Plan revision contains invalid workflow JSON: {err}"
+            ))
+        })?;
+
+    let mut changed = false;
+    for node in &mut plan_json.nodes {
+        let Some(override_item) = overrides.get(&node.id) else {
+            continue;
+        };
+        if let Some(lead_review) = override_item.lead_review {
+            if node.data.lead_review != Some(lead_review) {
+                node.data.lead_review = Some(lead_review);
+                changed = true;
+            }
+        }
+        if let Some(user_review) = override_item.user_review {
+            if node.data.user_review != Some(user_review) {
+                node.data.user_review = Some(user_review);
+                changed = true;
+            }
+        }
+    }
+
+    let session_agents = ChatSessionAgent::find_all_for_session(pool, session.id).await?;
+    let agents = load_agents_for_route(pool, &session_agents).await?;
+    let valid_agent_ids = agents
+        .iter()
+        .map(|agent| agent.id.to_string())
+        .collect::<Vec<_>>();
+    let validation = workflow_validator::validate_plan(&plan_json, &valid_agent_ids);
+    if !validation.is_valid {
+        let validation_message = validation
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.field, error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::BadRequest(validation_message));
+    }
+
+    let mut refreshed_execution = execution.clone();
+    if changed {
+        let plan_string = serde_json::to_string(&plan_json).map_err(|err| {
+            ApiError::BadRequest(format!("Failed to serialize workflow plan JSON: {err}"))
+        })?;
+        let plan_hash = WorkflowCompiler::compute_hash(&plan_json);
+        let plan_schema_version = plan_json
+            .plan_schema_version()
+            .map_err(ApiError::BadRequest)?;
+        let new_revision = WorkflowPlanRevision::create(
+            pool,
+            &CreateWorkflowPlanRevision {
+                plan_id: plan.id,
+                revision_no: active_revision.revision_no + 1,
+                edited_by: WorkflowRevisionEditor::System,
+                editor_session_agent_id: None,
+                reason: Some("workflow-review-settings".to_string()),
+                plan_json: plan_string.clone(),
+                plan_hash: plan_hash.clone(),
+                validation_status: WorkflowValidationStatus::Valid,
+                validation_errors_json: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await?;
+        WorkflowPlan::update_plan_json(
+            pool,
+            plan.id,
+            &plan_json.title,
+            Some(plan_json.goal.clone()),
+            &plan_string,
+            plan_schema_version,
+            &plan_hash,
+            WorkflowValidationStatus::Valid,
+            None,
+        )
+        .await?;
+        refreshed_execution = WorkflowExecution::update_compiled_graph_hash(
+            pool,
+            execution.id,
+            &plan_hash,
+            new_revision.id,
+        )
+        .await?;
+    }
+
+    let steps = WorkflowStep::find_by_execution(pool, execution.id).await?;
+    let loops = WorkflowLoop::find_by_execution(pool, execution.id).await?;
+    for step in steps {
+        let Some(override_item) = overrides.get(&step.step_key) else {
+            continue;
+        };
+        let lead_review_required = override_item
+            .lead_review
+            .unwrap_or(step.lead_review_required);
+        let user_review_required = override_item
+            .user_review
+            .unwrap_or(step.user_review_required);
+        if lead_review_required != step.lead_review_required
+            || user_review_required != step.user_review_required
+        {
+            WorkflowStep::update_review_requirements(
+                pool,
+                step.id,
+                lead_review_required,
+                user_review_required,
+            )
+            .await?;
+        }
+        if let Some(user_review) = override_item.user_review {
+            for workflow_loop in loops
+                .iter()
+                .filter(|workflow_loop| workflow_loop.review_step_id == step.id)
+            {
+                if workflow_loop.user_review_required != user_review {
+                    WorkflowLoop::update_user_review_required(pool, workflow_loop.id, user_review)
+                        .await?;
+                }
+            }
+        }
+    }
+
+    WorkflowOrchestrator::refresh_execution_projection_with_reason(
+        pool,
+        deployment.chat_runner(),
+        refreshed_execution.id,
+        None,
+        "review_settings_updated",
+        Vec::new(),
+    )
+    .await
+    .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+
+    let card_message_id = refreshed_execution
+        .workflow_card_message_id
+        .ok_or_else(|| {
+            ApiError::BadRequest("Workflow execution card message is missing.".to_string())
+        })?;
+    let card_message = ChatMessage::find_by_id(pool, card_message_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workflow execution card not found.".to_string()))?;
+    let projection =
+        super::messages::build_execution_workflow_card_projection(pool, &card_message).await?;
+
+    Ok(ResponseJson(ApiResponse::success(projection)))
 }
 
 fn parse_optional_execute_plan_request(
@@ -925,6 +1123,18 @@ fn collect_execute_plan_review_overrides(
     }
 
     overrides
+}
+
+fn collect_review_override_map(
+    step_review_overrides: Vec<ExecutePlanReviewOverride>,
+) -> HashMap<String, ExecutePlanReviewOverride> {
+    step_review_overrides
+        .into_iter()
+        .filter(|override_item| {
+            override_item.lead_review.is_some() || override_item.user_review.is_some()
+        })
+        .map(|override_item| (override_item.step_id.clone(), override_item))
+        .collect()
 }
 
 async fn resolve_step_action(

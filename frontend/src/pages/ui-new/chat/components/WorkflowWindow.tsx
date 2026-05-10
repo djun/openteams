@@ -19,6 +19,7 @@ import {
   Bot,
   RotateCcw,
   Ban,
+  Settings,
   type LucideIcon,
 } from 'lucide-react';
 import type { WorkflowCardData } from '@/lib/api';
@@ -75,6 +76,12 @@ type WorkflowRuntimeMessage = {
   createdAt: string;
 };
 
+type WorkflowReviewSettingOverride = {
+  stepId: string;
+  leadReview: boolean | null;
+  userReview: boolean;
+};
+
 type ExecutionRecordTab = 'DETAILS' | 'LOGS';
 
 type WorkflowTranscriptSummaryPayload = {
@@ -104,10 +111,11 @@ const REVIEW_READY_STEP_STATUSES = new Set([
 
 function parseWorkflowTranscriptTime(createdAt: string): Date {
   const trimmed = createdAt.trim();
-  const normalized =
-    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)
-      ? `${trimmed.replace(' ', 'T')}Z`
-      : trimmed;
+  const normalized = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(
+    trimmed
+  )
+    ? `${trimmed.replace(' ', 'T')}Z`
+    : trimmed;
 
   return new Date(normalized);
 }
@@ -195,7 +203,9 @@ function getTranscriptMarkdown(entry: WorkflowTranscriptEntry): string | null {
   return null;
 }
 
-function getTranscriptMetaSource(entry: WorkflowTranscriptEntry): string | null {
+function getTranscriptMetaSource(
+  entry: WorkflowTranscriptEntry
+): string | null {
   if (!entry.meta_json) {
     return null;
   }
@@ -212,11 +222,15 @@ function getTranscriptMetaSource(entry: WorkflowTranscriptEntry): string | null 
   }
 }
 
-function isWorkflowCardStepContentEntry(entry: WorkflowTranscriptEntry): boolean {
+function isWorkflowCardStepContentEntry(
+  entry: WorkflowTranscriptEntry
+): boolean {
   return getTranscriptMetaSource(entry) === 'workflow_card_step_content';
 }
 
-function isWorkflowRuntimeThinkingEntry(entry: WorkflowTranscriptEntry): boolean {
+function isWorkflowRuntimeThinkingEntry(
+  entry: WorkflowTranscriptEntry
+): boolean {
   return (
     entry.entry_type === 'thinking' &&
     getTranscriptMetaSource(entry) === 'workflow_runtime_stream'
@@ -251,7 +265,9 @@ function getWorkflowOutputEntryIcon(
   return MessageSquare;
 }
 
-function getWorkflowOutputEntryIconClass(entry: WorkflowTranscriptEntry): string {
+function getWorkflowOutputEntryIconClass(
+  entry: WorkflowTranscriptEntry
+): string {
   if (isWorkflowCardStepContentEntry(entry) || entry.entry_type === 'output') {
     return 'bg-blue-50 text-blue-600 border-blue-100';
   }
@@ -359,6 +375,10 @@ export type WorkflowWindowProps = {
   onInterruptStep?: (stepId: string) => void;
   onStopStep?: (stepId: string) => void;
   onRetryStep?: (stepId: string) => void;
+  onUpdateReviewSettings?: (
+    executionId: string,
+    overrides: WorkflowReviewSettingOverride[]
+  ) => void;
   onSubmitStepInput?: (stepId: string, inputText: string) => void;
   onApproval?: (
     stepId: string,
@@ -660,7 +680,7 @@ function InspectorCard({
   const isFailed = WORKFLOW_FAILURE_STEP_STATUSES.has(step.status);
   const isCompleted = step.status === 'completed';
   const hasError = isFailed || loopRejectionReason.length > 0;
-const hasFooterActions =
+  const hasFooterActions =
     step.status === 'running' ||
     step.status === 'waiting_review' ||
     step.status === 'pre_completed' ||
@@ -668,40 +688,45 @@ const hasFooterActions =
 
   const streamEntries = useMemo(
     () =>
-      transcriptEntries.filter((entry) => isWorkflowRuntimeThinkingEntry(entry)),
+      transcriptEntries.filter((entry) =>
+        isWorkflowRuntimeThinkingEntry(entry)
+      ),
     [transcriptEntries]
   );
   const agentLogGroups = useMemo(
     () =>
       Array.from(
-        streamEntries.reduce((groups, entry) => {
-          const groupAgentName = entry.agent_name?.trim() || agentName;
-          const groupKey = `${step.id}::${groupAgentName}`;
-          const existing = groups.get(groupKey);
-          const content = (getTranscriptMarkdown(entry) ?? entry.content).trim();
-          if (!content) return groups;
-          const lines = content
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean)
-            .map((line, index) => ({
-              key: `${entry.id}-${index}`,
-              timestamp: formatWorkflowLogTimestamp(entry.created_at),
-              content: line,
-              isError: /error|failed|fatal|exception/i.test(line),
-            }));
-          if (lines.length === 0) return groups;
-          if (existing) {
-            existing.lines.push(...lines);
-          } else {
-            groups.set(groupKey, {
-              key: groupKey,
-              agentName: groupAgentName,
-              lines,
-            });
-          }
-          return groups;
-        }, new Map<string, { key: string; agentName: string; lines: Array<{ key: string; timestamp: string; content: string; isError: boolean }> }>())
+        streamEntries
+          .reduce((groups, entry) => {
+            const groupAgentName = entry.agent_name?.trim() || agentName;
+            const groupKey = `${step.id}::${groupAgentName}`;
+            const existing = groups.get(groupKey);
+            const content = (
+              getTranscriptMarkdown(entry) ?? entry.content
+            ).trim();
+            if (!content) return groups;
+            const lines = content
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean)
+              .map((line, index) => ({
+                key: `${entry.id}-${index}`,
+                timestamp: formatWorkflowLogTimestamp(entry.created_at),
+                content: line,
+                isError: /error|failed|fatal|exception/i.test(line),
+              }));
+            if (lines.length === 0) return groups;
+            if (existing) {
+              existing.lines.push(...lines);
+            } else {
+              groups.set(groupKey, {
+                key: groupKey,
+                agentName: groupAgentName,
+                lines,
+              });
+            }
+            return groups;
+          }, new Map<string, { key: string; agentName: string; lines: Array<{ key: string; timestamp: string; content: string; isError: boolean }> }>())
           .values()
       ),
     [agentName, step.id, streamEntries]
@@ -788,7 +813,9 @@ const hasFooterActions =
               'inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider',
               hasError
                 ? 'bg-rose-50 text-rose-600'
-                : statusColors[step.status]?.replace(/border-[a-z]+-\d+/g, '').trim() || 'bg-slate-50 text-slate-500'
+                : statusColors[step.status]
+                    ?.replace(/border-[a-z]+-\d+/g, '')
+                    .trim() || 'bg-slate-50 text-slate-500'
             )}
           >
             {workflowStatusLabel(step.status)}
@@ -804,7 +831,9 @@ const hasFooterActions =
             </h2>
 
             <div className="mb-6 flex flex-wrap items-center gap-3 text-[11px] text-slate-400 font-medium">
-              <span className="flex items-center gap-1"><Bot className="w-3.5 h-3.5" /> {agentName}</span>
+              <span className="flex items-center gap-1">
+                <Bot className="w-3.5 h-3.5" /> {agentName}
+              </span>
               <span className="w-1 h-1 rounded-full bg-slate-300"></span>
               <span>{step.step_type}</span>
               {loopName && (
@@ -836,12 +865,12 @@ const hasFooterActions =
                   Summary
                 </h3>
                 <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
-                    <ChatMarkdown
-                      content={summaryText}
-                      maxWidth="100%"
-                      textClassName="text-[13px] text-slate-700 leading-relaxed [&_:not(pre)>code]:bg-slate-100 [&_:not(pre)>code]:text-slate-800 [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded-md"
-                      className="w-full select-text"
-                    />
+                  <ChatMarkdown
+                    content={summaryText}
+                    maxWidth="100%"
+                    textClassName="text-[13px] text-slate-700 leading-relaxed [&_:not(pre)>code]:bg-slate-100 [&_:not(pre)>code]:text-slate-800 [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded-md"
+                    className="w-full select-text"
+                  />
                 </div>
               </div>
             )}
@@ -867,50 +896,57 @@ const hasFooterActions =
                 Execution Record Output
               </h3>
               <div className="text-[13px] text-slate-600 leading-relaxed">
-              {isLoadingTranscript ? (
-                <div className="flex items-center gap-2 text-xs text-slate-400">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading transcript...
-                </div>
-              ) : outputEntries.length > 0 ? (
-                <div className="space-y-4">
-                  {outputEntries.map((entry) => {
-                    const markdownContent = getTranscriptMarkdown(entry);
-                    const OutputIcon = getWorkflowOutputEntryIcon(entry);
-                    const outputAgentName =
-                      entry.entry_type === 'message' || entry.entry_type === 'lead_review'
-                        ? entry.agent_name?.trim() || (entry.entry_type === 'lead_review' ? 'Lead' : undefined)
-                        : null;
-                    const outputLabel =
-                      outputAgentName || getWorkflowOutputEntryLabel(entry);
-                    return (
-                      <div key={entry.id} className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
-                        <div className="mb-3 inline-flex items-center gap-2 text-sm font-bold text-slate-600">
-                          <span
-                            className={cn(
-                              'inline-flex h-7 w-7 items-center justify-center rounded-lg border',
-                              getWorkflowOutputEntryIconClass(entry)
-                            )}
-                          >
-                            <OutputIcon className="h-4 w-4" />
-                          </span>
-                          {outputLabel}
+                {isLoadingTranscript ? (
+                  <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Loading transcript...
+                  </div>
+                ) : outputEntries.length > 0 ? (
+                  <div className="space-y-4">
+                    {outputEntries.map((entry) => {
+                      const markdownContent = getTranscriptMarkdown(entry);
+                      const OutputIcon = getWorkflowOutputEntryIcon(entry);
+                      const outputAgentName =
+                        entry.entry_type === 'message' ||
+                        entry.entry_type === 'lead_review'
+                          ? entry.agent_name?.trim() ||
+                            (entry.entry_type === 'lead_review'
+                              ? 'Lead'
+                              : undefined)
+                          : null;
+                      const outputLabel =
+                        outputAgentName || getWorkflowOutputEntryLabel(entry);
+                      return (
+                        <div
+                          key={entry.id}
+                          className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm"
+                        >
+                          <div className="mb-3 inline-flex items-center gap-2 text-sm font-bold text-slate-600">
+                            <span
+                              className={cn(
+                                'inline-flex h-7 w-7 items-center justify-center rounded-lg border',
+                                getWorkflowOutputEntryIconClass(entry)
+                              )}
+                            >
+                              <OutputIcon className="h-4 w-4" />
+                            </span>
+                            {outputLabel}
+                          </div>
+                          <ChatMarkdown
+                            content={markdownContent || entry.content}
+                            maxWidth="100%"
+                            textClassName="text-[13px] text-slate-700 leading-relaxed [&_:not(pre)>code]:bg-slate-100 [&_:not(pre)>code]:text-slate-800 [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded-md"
+                            className="w-full select-text"
+                          />
                         </div>
-                        <ChatMarkdown
-                          content={markdownContent || entry.content}
-                          maxWidth="100%"
-                          textClassName="text-[13px] text-slate-700 leading-relaxed [&_:not(pre)>code]:bg-slate-100 [&_:not(pre)>code]:text-slate-800 [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded-md"
-                          className="w-full select-text"
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="text-xs text-slate-400">
-                  No output entries for this step yet.
-                </div>
-              )}
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="text-xs text-slate-400">
+                    No output entries for this step yet.
+                  </div>
+                )}
               </div>
             </div>
 
@@ -920,7 +956,7 @@ const hasFooterActions =
                   <AlertCircle className="w-4 h-4" />
                   Error
                 </h3>
-                <div className="bg-rose-50/50 border border-rose-100 rounded-xl p-4 max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-rose-700">
+                <div className="bg-rose-50/50 border border-rose-100 rounded-xl p-4 max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-rose-700">
                   {loopRejectionReason || summaryText}
                 </div>
               </div>
@@ -945,9 +981,7 @@ const hasFooterActions =
                     key={group.key}
                     className={cn(
                       'overflow-hidden flex flex-col',
-                      isGroupCollapsed
-                        ? 'shrink-0'
-                        : 'flex-1 min-h-[50%]',
+                      isGroupCollapsed ? 'shrink-0' : 'flex-1 min-h-[50%]',
                       groupIndex < agentLogGroups.length - 1 &&
                         'border-b border-slate-700'
                     )}
@@ -978,7 +1012,7 @@ const hasFooterActions =
                           return (
                             <div
                               key={line.key}
-                              className="flex items-start px-2 py-0.5 text-[12px] text-slate-300 hover:bg-slate-800"
+                              className="flex items-start px-2 py-0.5 text-[11px] text-slate-300 hover:bg-slate-800"
                             >
                               <span className="mr-4 shrink-0 select-none text-slate-500">
                                 [{line.timestamp}]
@@ -1005,7 +1039,7 @@ const hasFooterActions =
                   </div>
                 );
               })
-              ) : (
+            ) : (
               <div className="flex items-center justify-center py-8 text-xs text-slate-500">
                 No logs for this step yet.
               </div>
@@ -1148,12 +1182,15 @@ function ChatPanel({
         className="flex-1 p-4 space-y-4 overflow-y-auto flex flex-col py-6"
       >
         {outputEntries.map((entry) => {
-          const isUser = entry.message_type === 'user' && entry.entry_type !== 'lead_review';
+          const isUser =
+            entry.message_type === 'user' && entry.entry_type !== 'lead_review';
           const markdownContent = getTranscriptMarkdown(entry);
           const entryAgentName =
             !isUser && entry.agent_name?.trim()
               ? entry.agent_name.trim()
-              : (entry.entry_type === 'lead_review' ? 'Lead' : null);
+              : entry.entry_type === 'lead_review'
+                ? 'Lead'
+                : null;
 
           if (
             entry.entry_type === 'approval_request' ||
@@ -1317,6 +1354,7 @@ export function WorkflowWindow({
   onInterruptStep,
   onStopStep,
   onRetryStep,
+  onUpdateReviewSettings,
   onSubmitStepInput,
   onApproval,
   onResolveFinalReview,
@@ -1331,6 +1369,10 @@ export function WorkflowWindow({
   const [runtimeInputTranscripts, setRuntimeInputTranscripts] = useState<
     WorkflowTranscriptEntry[]
   >([]);
+  const [isReviewSettingsOpen, setIsReviewSettingsOpen] = useState(false);
+  const [reviewSettingsDraft, setReviewSettingsDraft] = useState<
+    Record<string, { leadReview: boolean; userReview: boolean }>
+  >({});
   const initializedWorkflowKeyRef = useRef<string | null>(null);
   const previousExecutionIdRef = useRef<string | null>(null);
 
@@ -1404,13 +1446,18 @@ export function WorkflowWindow({
     () => new Map(projection.steps.map((step) => [step.step_key, step])),
     [projection.steps]
   );
+  const stepById = useMemo(
+    () => new Map(projection.steps.map((step) => [step.id, step])),
+    [projection.steps]
+  );
   const planNodeById = useMemo(
     () => new Map(projection.plan.nodes.map((node) => [node.id, node])),
     [projection.plan.nodes]
   );
-  const workflowLoops = useMemo(() => projection.loops ?? [], [
-    projection.loops,
-  ]);
+  const workflowLoops = useMemo(
+    () => projection.loops ?? [],
+    [projection.loops]
+  );
   const loopByKey = useMemo(
     () => new Map(workflowLoops.map((loop) => [loop.loop_key, loop])),
     [workflowLoops]
@@ -1419,6 +1466,104 @@ export function WorkflowWindow({
     () => `${projection.execution_id ?? ''}::${projection.plan_id ?? ''}`,
     [projection.execution_id, projection.plan_id]
   );
+  const taskReviewSettingsRows = useMemo(
+    () =>
+      projection.plan.nodes
+        .filter((node) => node.data.stepType === 'task')
+        .map((node) => {
+          const step = stepByKey.get(node.id);
+          return {
+            stepId: node.id,
+            title: step?.title ?? node.data.title,
+            stepType: node.data.stepType,
+            leadReview: node.data.leadReview ?? true,
+            userReview: node.data.userReview ?? false,
+          };
+        }),
+    [projection.plan.nodes, stepByKey]
+  );
+  const loopReviewSettingsRows = useMemo(
+    () =>
+      workflowLoops.flatMap((workflowLoop) => {
+        const reviewStep = stepById.get(workflowLoop.review_step_id);
+        if (!reviewStep) return [];
+        const reviewNode = planNodeById.get(reviewStep.step_key);
+        return {
+          stepId: reviewStep.step_key,
+          title:
+            workflowLoop.loop_key || reviewNode?.data.title || reviewStep.title,
+          reviewStepTitle: reviewStep.title,
+          description: `${workflowLoop.member_step_ids.length} tasks / review step: ${reviewStep.title}`,
+          memberCount: workflowLoop.member_step_ids.length,
+          userReview:
+            reviewNode?.data.userReview ??
+            workflowLoop.user_review_required ??
+            false,
+        };
+      }),
+    [planNodeById, stepById, workflowLoops]
+  );
+
+  useEffect(() => {
+    setReviewSettingsDraft(
+      Object.fromEntries([
+        ...taskReviewSettingsRows.map((row) => [
+          row.stepId,
+          {
+            leadReview: row.leadReview,
+            userReview: row.userReview,
+          },
+        ]),
+        ...loopReviewSettingsRows.map((row) => [
+          row.stepId,
+          {
+            leadReview: false,
+            userReview: row.userReview,
+          },
+        ]),
+      ] as Array<[string, { leadReview: boolean; userReview: boolean }]>)
+    );
+  }, [loopReviewSettingsRows, taskReviewSettingsRows]);
+
+  const updateReviewSettingDraft = useCallback(
+    (stepId: string, key: 'leadReview' | 'userReview', value: boolean) => {
+      setReviewSettingsDraft((prev) => ({
+        ...prev,
+        [stepId]: {
+          leadReview: prev[stepId]?.leadReview ?? true,
+          userReview: prev[stepId]?.userReview ?? false,
+          [key]: value,
+        },
+      }));
+    },
+    []
+  );
+
+  const handleSaveReviewSettings = useCallback(() => {
+    if (!projection.execution_id || !onUpdateReviewSettings) return;
+    onUpdateReviewSettings(projection.execution_id, [
+      ...taskReviewSettingsRows.map((row) => ({
+        stepId: row.stepId,
+        leadReview:
+          reviewSettingsDraft[row.stepId]?.leadReview ?? row.leadReview,
+        userReview:
+          reviewSettingsDraft[row.stepId]?.userReview ?? row.userReview,
+      })),
+      ...loopReviewSettingsRows.map((row) => ({
+        stepId: row.stepId,
+        leadReview: null,
+        userReview:
+          reviewSettingsDraft[row.stepId]?.userReview ?? row.userReview,
+      })),
+    ]);
+    setIsReviewSettingsOpen(false);
+  }, [
+    onUpdateReviewSettings,
+    projection.execution_id,
+    loopReviewSettingsRows,
+    reviewSettingsDraft,
+    taskReviewSettingsRows,
+  ]);
   const resolveStepAgentName = useCallback(
     (step?: WorkflowCardStep | null) => {
       const rawAgent = step?.agent_name?.trim();
@@ -1505,11 +1650,13 @@ export function WorkflowWindow({
   const activeStep = useMemo(
     () =>
       activeNodeId
-        ? projection.steps.find((s) => s.step_key === activeNodeId) ?? null
+        ? (projection.steps.find((s) => s.step_key === activeNodeId) ?? null)
         : null,
     [activeNodeId, projection.steps]
   );
-  const activePlanNode = activeNodeId ? planNodeById.get(activeNodeId) ?? null : null;
+  const activePlanNode = activeNodeId
+    ? (planNodeById.get(activeNodeId) ?? null)
+    : null;
   const activeStepLoop = activeStep?.loop_key
     ? (loopByKey.get(activeStep.loop_key) ?? null)
     : null;
@@ -1635,9 +1782,7 @@ export function WorkflowWindow({
           agent_name: message.agentName,
           message_type: 'agent',
           entry_type:
-            message.streamType === 'assistant'
-              ? 'message'
-              : message.streamType,
+            message.streamType === 'assistant' ? 'message' : message.streamType,
           content: message.content,
           meta_json: JSON.stringify({
             source: 'workflow_runtime_stream',
@@ -1824,11 +1969,187 @@ export function WorkflowWindow({
                 </button>
               )}
           </div>
+          {projection.execution_id && onUpdateReviewSettings && (
+            <button
+              type="button"
+              onClick={() => setIsReviewSettingsOpen((open) => !open)}
+              className="p-2 rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-800 transition-colors"
+              title="Review settings"
+              aria-label="Review settings"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+          )}
         </div>
       </header>
 
       {/* Main Content Area */}
       <div className="relative flex-1 overflow-hidden flex">
+        {isReviewSettingsOpen && (
+          <div className="absolute right-6 top-6 z-[70] w-[360px] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">
+                  Review settings
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  Configure task reviews and workflow loop user reviews.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsReviewSettingsOpen(false)}
+                className="rounded-md p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+                aria-label="Close review settings"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="max-h-[420px] overflow-y-auto px-4 py-3">
+              {taskReviewSettingsRows.length > 0 && (
+                <div>
+                  <div className="grid grid-cols-[1fr_76px_76px] gap-2 border-b border-slate-100 pb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    <span>Task step</span>
+                    <span className="text-center">Lead</span>
+                    <span className="text-center">User</span>
+                  </div>
+                  <div className="divide-y divide-slate-100">
+                    {taskReviewSettingsRows.map((row) => {
+                      const draft = reviewSettingsDraft[row.stepId] ?? {
+                        leadReview: row.leadReview,
+                        userReview: row.userReview,
+                      };
+                      return (
+                        <div
+                          key={row.stepId}
+                          className="grid grid-cols-[1fr_76px_76px] items-center gap-2 py-3"
+                        >
+                          <div className="min-w-0">
+                            <div className="group relative min-w-0">
+                              <div className="truncate text-xs font-semibold text-slate-800">
+                                {row.title}
+                              </div>
+                              <div className="pointer-events-none absolute left-0 top-full z-[90] mt-1 hidden max-w-[280px] rounded-md bg-slate-900 px-2.5 py-1.5 text-[9px] font-medium leading-4 text-white shadow-lg group-hover:block">
+                                {row.title}
+                              </div>
+                            </div>
+                            <div className="mt-0.5 text-[10px] uppercase tracking-wider text-slate-400">
+                              {row.stepType}
+                            </div>
+                          </div>
+                          <label className="flex justify-center">
+                            <input
+                              type="checkbox"
+                              checked={draft.leadReview}
+                              onChange={(event) =>
+                                updateReviewSettingDraft(
+                                  row.stepId,
+                                  'leadReview',
+                                  event.target.checked
+                                )
+                              }
+                              className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                            />
+                          </label>
+                          <label className="flex justify-center">
+                            <input
+                              type="checkbox"
+                              checked={draft.userReview}
+                              onChange={(event) =>
+                                updateReviewSettingDraft(
+                                  row.stepId,
+                                  'userReview',
+                                  event.target.checked
+                                )
+                              }
+                              className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                            />
+                          </label>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {loopReviewSettingsRows.length > 0 && (
+                <div
+                  className={taskReviewSettingsRows.length > 0 ? 'mt-5' : ''}
+                >
+                  <div className="grid grid-cols-[1fr_76px] gap-2 border-b border-slate-100 pb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    <span>Workflow loop</span>
+                    <span className="text-center">User</span>
+                  </div>
+                  <div className="divide-y divide-slate-100">
+                    {loopReviewSettingsRows.map((row) => {
+                      const draft = reviewSettingsDraft[row.stepId] ?? {
+                        leadReview: false,
+                        userReview: row.userReview,
+                      };
+                      return (
+                        <div
+                          key={row.stepId}
+                          className="grid grid-cols-[1fr_76px] items-center gap-2 py-3"
+                        >
+                          <div className="min-w-0">
+                            <div className="group relative min-w-0">
+                              <div className="truncate text-xs font-semibold text-slate-800">
+                                {row.title}
+                              </div>
+                              <div className="pointer-events-none absolute left-0 top-full z-[90] mt-1 hidden max-w-[280px] rounded-md bg-slate-900 px-2.5 py-1.5 text-[9px] font-medium leading-4 text-white shadow-lg group-hover:block">
+                                {row.title}
+                              </div>
+                            </div>
+                            <div className="group relative mt-0.5 min-w-0">
+                              <div className="truncate text-[10px] uppercase tracking-wider text-slate-400">
+                                {row.description}
+                              </div>
+                              <div className="pointer-events-none absolute left-0 top-full z-[90] mt-1 hidden max-w-[300px] rounded-md bg-slate-900 px-2.5 py-1.5 text-[9px] font-medium normal-case leading-4 tracking-normal text-white shadow-lg group-hover:block">
+                                {row.description}
+                              </div>
+                            </div>
+                          </div>
+                          <label className="flex justify-center">
+                            <input
+                              type="checkbox"
+                              checked={draft.userReview}
+                              onChange={(event) =>
+                                updateReviewSettingDraft(
+                                  row.stepId,
+                                  'userReview',
+                                  event.target.checked
+                                )
+                              }
+                              className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                            />
+                          </label>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
+              <button
+                type="button"
+                onClick={() => setIsReviewSettingsOpen(false)}
+                className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveReviewSettings}
+                disabled={!projection.execution_id || !onUpdateReviewSettings}
+                className="rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Workflow Canvas */}
         <WorkflowGraphBoard
           nodes={projection.plan.nodes}
@@ -1965,15 +2286,16 @@ export function WorkflowWindow({
                 currentRound={projection.current_round}
                 completedSteps={projection.completed_step_count}
                 totalSteps={projection.total_step_count}
-                runningStepTitle={projection.steps.find((s) => s.status === 'running' || s.status === 'failed')?.title ?? null}
+                runningStepTitle={
+                  projection.steps.find(
+                    (s) => s.status === 'running' || s.status === 'failed'
+                  )?.title ?? null
+                }
                 iterationHistory={projection.iteration_history}
                 canReviewCurrentRound={canReviewCurrentRound}
                 pendingActionId={pendingActionId}
                 onSubmit={(payload) => {
-                  if (
-                    !projection.execution_id ||
-                    !onSubmitIterationFeedback
-                  )
+                  if (!projection.execution_id || !onSubmitIterationFeedback)
                     return;
                   onSubmitIterationFeedback({
                     executionId: projection.execution_id,
@@ -2065,8 +2387,7 @@ export function WorkflowWindow({
                   onClose={() => setIsChatVisible(false)}
                   onSendInput={handleSendStepInput}
                   canSendInput={
-                    !!onSubmitStepInput &&
-                    activeStep.status === 'waiting_input'
+                    !!onSubmitStepInput && activeStep.status === 'waiting_input'
                   }
                 />
               </motion.aside>

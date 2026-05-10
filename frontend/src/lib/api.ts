@@ -240,6 +240,9 @@ export interface WorkflowCardData {
         instructions: string;
         agentId?: string | null;
         status?: string | null;
+        leadReview?: boolean | null;
+        userReview?: boolean | null;
+        reviewScope?: string[] | null;
       };
     }>;
     edges: Array<{
@@ -975,6 +978,21 @@ export const chatApi = {
       }
     );
     return handleApiResponse<ExecutePlanResponse>(response);
+  },
+
+  updateWorkflowReviewSettings: async (
+    sessionId: string,
+    executionId: string,
+    payload: Pick<ExecutePlanRequest, 'stepReviewOverrides'>
+  ): Promise<WorkflowCardData> => {
+    const response = await makeRequest(
+      `/api/chat/sessions/${sessionId}/workflow/executions/${executionId}/review-settings`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
+    return handleApiResponse<WorkflowCardData>(response);
   },
 
   pauseAll: async (

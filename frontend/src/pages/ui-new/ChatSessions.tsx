@@ -28,6 +28,7 @@ import {
   type JsonValue,
   type ChatMemberPreset,
   type ChatTeamPreset,
+  type ExecutePlanReviewOverride,
 } from 'shared/types';
 import { ApiError, chatApi, configApi } from '@/lib/api';
 import { resolveAppLanguageCode } from '@/i18n/languages';
@@ -925,6 +926,38 @@ export function ChatSessions() {
     },
   });
 
+  const updateWorkflowReviewSettingsMutation = useMutation({
+    mutationFn: async ({
+      executionId,
+      overrides,
+    }: {
+      executionId: string;
+      overrides: ExecutePlanReviewOverride[];
+    }) => {
+      if (!activeSessionId) throw new Error('No active session');
+      return chatApi.updateWorkflowReviewSettings(
+        activeSessionId,
+        executionId,
+        {
+          stepReviewOverrides: overrides,
+        }
+      );
+    },
+    onSuccess: () => {
+      if (!activeSessionId) return;
+      queryClient.invalidateQueries({
+        queryKey: ['chatMessages', activeSessionId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ['workflowTranscripts', activeSessionId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ['workflowStepTranscripts', activeSessionId],
+      });
+      setWorkflowCardRefreshNonce((prev) => prev + 1);
+    },
+  });
+
   const pauseAllMutation = useMutation({
     mutationFn: async (executionId: string) => {
       if (!activeSessionId) throw new Error('No active session');
@@ -957,6 +990,23 @@ export function ChatSessions() {
       pauseAllMutation.mutate(executionId);
     },
     [pauseAllMutation]
+  );
+
+  const handleUpdateWorkflowReviewSettings = useCallback(
+    (
+      executionId: string,
+      overrides: Array<{
+        stepId: string;
+        leadReview: boolean | null;
+        userReview: boolean;
+      }>
+    ) => {
+      updateWorkflowReviewSettingsMutation.mutate({
+        executionId,
+        overrides,
+      });
+    },
+    [updateWorkflowReviewSettingsMutation]
   );
 
   const interruptStepMutation = useMutation({
@@ -1091,8 +1141,10 @@ export function ChatSessions() {
   const [workflowWindowOpen, setWorkflowWindowOpen] = useState(false);
   const [workflowWindowCardMessageId, setWorkflowWindowCardMessageId] =
     useState<string | null>(null);
-  const [workflowWindowFallbackProjection, setWorkflowWindowFallbackProjection] =
-    useState<WorkflowWindowProjection | null>(null);
+  const [
+    workflowWindowFallbackProjection,
+    setWorkflowWindowFallbackProjection,
+  ] = useState<WorkflowWindowProjection | null>(null);
   const [workflowCardRefreshNonce, setWorkflowCardRefreshNonce] = useState(0);
   const [
     workflowCardProjectionByMessageId,
@@ -1547,7 +1599,9 @@ export function ChatSessions() {
       return respondWorkflowReviewMutation.variables?.reviewId ?? null;
     }
     if (submitWorkflowIterationFeedbackMutation.isPending) {
-      return submitWorkflowIterationFeedbackMutation.variables?.executionId ?? null;
+      return (
+        submitWorkflowIterationFeedbackMutation.variables?.executionId ?? null
+      );
     }
     return null;
   }, [
@@ -1726,6 +1780,9 @@ export function ChatSessions() {
     MemberPresetImportPlan[] | null
   >(null);
   const [teamImportName, setTeamImportName] = useState<string | null>(null);
+  const [teamImportLeadMemberId, setTeamImportLeadMemberId] = useState<
+    string | null
+  >(null);
   const [teamImportProtocol, setTeamImportProtocol] = useState<string | null>(
     null
   );
@@ -1859,6 +1916,7 @@ export function ChatSessions() {
     setPromptFileLoading(false);
     setTeamImportPlan(null);
     setTeamImportName(null);
+    setTeamImportLeadMemberId(null);
   }, [activeSessionId, resetDiffViewer]);
 
   useEffect(() => {
@@ -3783,8 +3841,11 @@ export function ChatSessions() {
   }, []);
 
   const importMembersFromPlan = useCallback(
-    async (plan: MemberPresetImportPlan[]) => {
-      if (!activeSessionId) return;
+    async (
+      plan: MemberPresetImportPlan[]
+    ): Promise<Map<string, string>> => {
+      const presetToAgentMap = new Map<string, string>();
+      if (!activeSessionId) return presetToAgentMap;
 
       for (const entry of plan) {
         if (entry.action === 'skip') continue;
@@ -3814,6 +3875,8 @@ export function ChatSessions() {
           workspace_path: entry.workspacePath,
           allowed_skill_ids: selectedSkillIds,
         });
+
+        presetToAgentMap.set(entry.presetId, agentId);
       }
 
       await Promise.all([
@@ -3822,6 +3885,8 @@ export function ChatSessions() {
           queryKey: ['chatSessionAgents', activeSessionId],
         }),
       ]);
+
+      return presetToAgentMap;
     },
     [activeSessionId, normalizeAllowedSkillIds, queryClient]
   );
@@ -3959,6 +4024,7 @@ export function ChatSessions() {
       }
 
       setTeamImportName(getLocalizedMemberPresetName(preset, t));
+      setTeamImportLeadMemberId(null);
       setTeamImportProtocol(null);
       setTeamImportPlan([plan]);
       setMemberError(null);
@@ -3984,6 +4050,12 @@ export function ChatSessions() {
       }
 
       setTeamImportName(getLocalizedTeamPresetName(teamPreset, t));
+      // lead_member_id is available on the runtime object but may not be in
+      // the generated TypeScript type until types are regenerated (task 8.1).
+      const leadMemberId =
+        (teamPreset as ChatTeamPreset & { lead_member_id?: string })
+          .lead_member_id ?? null;
+      setTeamImportLeadMemberId(leadMemberId);
       setTeamImportProtocol(
         resolveTeamImportProtocol(teamPreset.team_protocol)
       );
@@ -4079,6 +4151,7 @@ export function ChatSessions() {
       setMemberError(t('members.importPreview.errors.nothingToImport'));
       setTeamImportPlan(null);
       setTeamImportName(null);
+      setTeamImportLeadMemberId(null);
       setTeamImportProtocol(null);
       return;
     }
@@ -4110,9 +4183,40 @@ export function ChatSessions() {
         });
         setTeamProtocolRefreshToken((current) => current + 1);
       }
-      await importMembersFromPlan(preparedPlan);
+      const presetToAgentMap = await importMembersFromPlan(preparedPlan);
+
+      // Set lead_agent_id from team preset's lead_member_id
+      if (teamImportLeadMemberId && presetToAgentMap.size > 0) {
+        const leadAgentId = presetToAgentMap.get(teamImportLeadMemberId);
+        if (leadAgentId) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await chatApi.updateSession(activeSessionId, {
+            lead_agent_id: leadAgentId,
+          } as any);
+        } else {
+          // Fallback to first imported member if lead_member_id not found
+          const firstAgentId = presetToAgentMap.values().next().value;
+          if (firstAgentId) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            await chatApi.updateSession(activeSessionId, {
+              lead_agent_id: firstAgentId,
+            } as any);
+          }
+        }
+      } else if (presetToAgentMap.size > 0) {
+        // No lead_member_id set - fall back to first member
+        const firstAgentId = presetToAgentMap.values().next().value;
+        if (firstAgentId) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await chatApi.updateSession(activeSessionId, {
+            lead_agent_id: firstAgentId,
+          } as any);
+        }
+      }
+
       setTeamImportPlan(null);
       setTeamImportName(null);
+      setTeamImportLeadMemberId(null);
       setTeamImportProtocol(null);
       setIsAddMemberOpen(false);
     } catch (error) {
@@ -4133,6 +4237,7 @@ export function ChatSessions() {
     isArchived,
     setIsAddMemberOpen,
     teamImportPlan,
+    teamImportLeadMemberId,
     teamImportProtocol,
     t,
     validateAndPrepareImportPlan,
@@ -4142,6 +4247,7 @@ export function ChatSessions() {
     if (isImportingTeam) return;
     setTeamImportPlan(null);
     setTeamImportName(null);
+    setTeamImportLeadMemberId(null);
     setTeamImportProtocol(null);
   }, [isImportingTeam]);
 
@@ -5454,6 +5560,7 @@ export function ChatSessions() {
           onInterruptStep={handleInterruptStep}
           onStopStep={(stepId) => stopWorkflowStepMutation.mutate(stepId)}
           onRetryStep={(stepId) => retryWorkflowStepMutation.mutate(stepId)}
+          onUpdateReviewSettings={handleUpdateWorkflowReviewSettings}
           onSubmitStepInput={(stepId, inputText) =>
             submitWorkflowStepInputMutation.mutate({ stepId, inputText })
           }
