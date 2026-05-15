@@ -1106,6 +1106,7 @@ Hard requirements:
 - `agents.available` and `nodes[].data.agentId` may only use the provided `agent_id` values.
 - `globals`, `policies`, and optional node/edge fields may be omitted when unnecessary.
 - `reviewScope` rules: task-only ids, upstream predecessors only, include intermediates, each task in at most one scope, no result/review/unknown/downstream ids. If two loops need similar work, split into separate tasks or keep shared setup outside `reviewScope`.
+- when multiple agents need to edit the same file or directory in parallel, use git worktree for isolation and merge changes back to the mainline afterward. If Git is not available, use alternative isolation methods.
 
 ## Recommended Skills
 - For tasks that include coding, please ensure you utilize the `writing-plans` skill.
