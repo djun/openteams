@@ -1242,8 +1242,10 @@ impl WorkflowOrchestrator {
         if to == WorkflowExecutionStatus::Running && transitioned.started_at.is_none() {
             transitioned = WorkflowExecution::set_started(pool, transitioned.id).await?;
         }
-        if matches!(to, WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed)
-            && transitioned.completed_at.is_none()
+        if matches!(
+            to,
+            WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
+        ) && transitioned.completed_at.is_none()
         {
             transitioned = WorkflowExecution::set_completed(pool, transitioned.id).await?;
         }

@@ -6,16 +6,14 @@ use db::models::{
     workflow_iteration_feedback::WorkflowIterationFeedback, workflow_loop::WorkflowLoop,
     workflow_plan::WorkflowPlan, workflow_plan_revision::WorkflowPlanRevision,
     workflow_round::WorkflowRound, workflow_step::WorkflowStep,
-    workflow_step_review::WorkflowStepReview,
-    workflow_transcript::WorkflowTranscript,
+    workflow_step_review::WorkflowStepReview, workflow_transcript::WorkflowTranscript,
 };
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::{
     super::{
-        chat_runner::ChatRunner,
-        workflow_runtime::{build_workflow_card_projection_lightweight},
+        chat_runner::ChatRunner, workflow_runtime::build_workflow_card_projection_lightweight,
     },
     OrchestratorError, WorkflowOrchestrator, load_agents_for_session,
 };

@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use db::models::chat_session_agent::ChatSessionAgent;
-use db::models::chat_skill::ChatSkill;
+use db::models::{chat_session_agent::ChatSessionAgent, chat_skill::ChatSkill};
 use executors::{
     executors::{BaseCodingAgent, StandardCodingAgentExecutor},
     profile::{ExecutorConfigs, ExecutorProfileId},
@@ -253,11 +252,8 @@ pub async fn ensure_builtin_skills_installed(
         if skill_dir.join("SKILL.md").exists() {
             continue;
         }
-        match install_skill_files_from_embedded(
-            skill,
-            Some(&[entry.agent_dir_id.to_string()]),
-        )
-        .await
+        match install_skill_files_from_embedded(skill, Some(&[entry.agent_dir_id.to_string()]))
+            .await
         {
             Ok(count) => {
                 tracing::info!(
@@ -300,10 +296,8 @@ pub async fn auto_allow_builtin_skills(
     }
 
     let installed = list_native_skills_for_runner(pool, runner).await?;
-    let wanted_names: std::collections::HashSet<String> = skill_names
-        .iter()
-        .map(|s| slugify_skill_name(s))
-        .collect();
+    let wanted_names: std::collections::HashSet<String> =
+        skill_names.iter().map(|s| slugify_skill_name(s)).collect();
 
     let builtin_skill_ids: Vec<String> = installed
         .iter()
@@ -333,8 +327,8 @@ pub async fn auto_allow_builtin_skills(
     }
 
     if changed {
-        let updated = ChatSessionAgent::update_allowed_skill_ids(pool, session_agent.id, merged)
-            .await?;
+        let updated =
+            ChatSessionAgent::update_allowed_skill_ids(pool, session_agent.id, merged).await?;
         *session_agent = updated;
     }
 

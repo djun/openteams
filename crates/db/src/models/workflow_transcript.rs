@@ -243,9 +243,8 @@ impl WorkflowTranscript {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let mut sql = String::from(
-            "SELECT t.* FROM chat_workflow_transcripts t WHERE t.execution_id = ?",
-        );
+        let mut sql =
+            String::from("SELECT t.* FROM chat_workflow_transcripts t WHERE t.execution_id = ?");
         let mut param_idx: u32 = 1;
         if step_id.is_some() {
             param_idx += 1;
@@ -259,9 +258,7 @@ impl WorkflowTranscript {
         }
         if workflow_agent_session_id.is_some() {
             param_idx += 1;
-            sql.push_str(&format!(
-                " AND t.workflow_agent_session_id = ?{param_idx}"
-            ));
+            sql.push_str(&format!(" AND t.workflow_agent_session_id = ?{param_idx}"));
         }
         sql.push_str(" ORDER BY t.created_at ASC");
 
@@ -705,7 +702,11 @@ mod tests {
                 &CreateWorkflowTranscript {
                     execution_id,
                     round_id: None,
-                    workflow_agent_session_id: if i % 2 == 0 { Some(agent_session) } else { None },
+                    workflow_agent_session_id: if i % 2 == 0 {
+                        Some(agent_session)
+                    } else {
+                        None
+                    },
                     step_id,
                     sender_type: "agent".to_string(),
                     entry_type: "thinking".to_string(),
@@ -719,35 +720,65 @@ mod tests {
         }
 
         let by_step_id = WorkflowTranscript::find_by_execution_with_step_filter(
-            &pool, execution_id, Some(step_a), None, None, None, None,
+            &pool,
+            execution_id,
+            Some(step_a),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("filter by step_id");
         assert_eq!(by_step_id.len(), 3);
 
         let by_step_key = WorkflowTranscript::find_by_execution_with_step_filter(
-            &pool, execution_id, None, Some("step_b"), None, None, None,
+            &pool,
+            execution_id,
+            None,
+            Some("step_b"),
+            None,
+            None,
+            None,
         )
         .await
         .expect("filter by step_key");
         assert_eq!(by_step_key.len(), 3);
 
         let by_agent = WorkflowTranscript::find_by_execution_with_step_filter(
-            &pool, execution_id, None, None, Some(agent_session), None, None,
+            &pool,
+            execution_id,
+            None,
+            None,
+            Some(agent_session),
+            None,
+            None,
         )
         .await
         .expect("filter by agent");
         assert_eq!(by_agent.len(), 3);
 
         let combined = WorkflowTranscript::find_by_execution_with_step_filter(
-            &pool, execution_id, Some(step_a), None, Some(agent_session), None, None,
+            &pool,
+            execution_id,
+            Some(step_a),
+            None,
+            Some(agent_session),
+            None,
+            None,
         )
         .await
         .expect("filter by step_id+agent");
         assert_eq!(combined.len(), 2);
 
         let paginated = WorkflowTranscript::find_by_execution_with_step_filter(
-            &pool, execution_id, Some(step_a), None, None, Some(2), Some(1),
+            &pool,
+            execution_id,
+            Some(step_a),
+            None,
+            None,
+            Some(2),
+            Some(1),
         )
         .await
         .expect("filter by step_id with pagination");

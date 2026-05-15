@@ -196,10 +196,11 @@ impl ChatRunner {
         let skills = self
             .resolve_session_agent_skills(session_agent, agent)
             .await?;
-        let mut required_installed_skills = crate::services::agent_skill_policy::required_builtin_skills(context)
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let mut required_installed_skills =
+            crate::services::agent_skill_policy::required_builtin_skills(context)
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
         for skill in &skills {
             let name = skill.name.trim();
             if !name.is_empty()

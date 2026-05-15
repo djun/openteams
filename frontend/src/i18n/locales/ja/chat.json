@@ -99,6 +99,9 @@
       }
     },
     "mentionAgents": "エージェントをメンション",
+    "chatModeName": "チャットモード",
+    "workflowModeName": "ワークフローモード",
+    "modeSwitchTooltip": "現在は{{currentMode}}、クリックして{{targetMode}}に切り替えます。",
     "switchToFreeMode": "自由チャットモードに切り替え",
     "switchToWorkflowMode": "ワークフローモードに切り替え",
     "freeModeDescription": "自由チャットモード: @ でメンバーにメッセージをルーティングします。",

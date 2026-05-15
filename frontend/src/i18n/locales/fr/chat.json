@@ -99,6 +99,9 @@
       }
     },
     "mentionAgents": "Mentionner des agents",
+    "chatModeName": "mode chat",
+    "workflowModeName": "mode workflow",
+    "modeSwitchTooltip": "Mode actuel {{currentMode}}, cliquez pour passer en {{targetMode}}.",
     "switchToFreeMode": "Basculer en discussion libre",
     "switchToWorkflowMode": "Basculer en mode workflow",
     "freeModeDescription": "Discussion libre : utilisez @ pour router les messages aux membres.",

@@ -1,6 +1,6 @@
 //! Plan / card creation, plan execution, pause / interrupt control.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use db::models::{
     chat_message::{ChatMessage, ChatSenderType},
@@ -263,7 +263,8 @@ impl WorkflowOrchestrator {
             "workflow_card": serde_json::to_value(&preview)?,
         });
 
-        // Single-card contract: reuse existing workflow card if present
+        // Reuse the current draft/active workflow card, but keep completed
+        // workflow cards immutable so a session can show multiple plans over time.
         let existing_card_id = if let Some(message_id) = preferred_card_message_id {
             Some(message_id)
         } else {
@@ -299,8 +300,12 @@ impl WorkflowOrchestrator {
         Ok((plan, revision, message))
     }
 
-    /// Find the existing workflow card message in this session by looking at
+    /// Find the reusable workflow card message in this session by looking at
     /// plans that already have a `workflow_card_message_id`.
+    ///
+    /// A preview plan without execution can be replaced during regeneration, and
+    /// an active execution keeps its card. Terminal executions are skipped so a
+    /// completed workflow remains visible when the session creates a later plan.
     pub async fn find_session_workflow_card_message_id(
         pool: &SqlitePool,
         session_id: Uuid,
@@ -308,8 +313,44 @@ impl WorkflowOrchestrator {
         let plans = WorkflowPlan::find_by_session(pool, session_id)
             .await
             .unwrap_or_default();
+        let executions = WorkflowExecution::find_by_session(pool, session_id)
+            .await
+            .unwrap_or_default();
+        let terminal_card_message_ids = executions
+            .iter()
+            .filter(|execution| {
+                matches!(
+                    execution.status,
+                    WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
+                )
+            })
+            .filter_map(|execution| execution.workflow_card_message_id)
+            .collect::<HashSet<_>>();
+
         for plan in &plans {
-            if let Some(card_msg_id) = plan.workflow_card_message_id {
+            let Some(card_msg_id) = plan.workflow_card_message_id else {
+                continue;
+            };
+            if terminal_card_message_ids.contains(&card_msg_id) {
+                continue;
+            }
+            let plan_executions = executions
+                .iter()
+                .filter(|execution| execution.plan_id == plan.id)
+                .collect::<Vec<_>>();
+
+            if plan_executions.is_empty()
+                || plan_executions.iter().any(|execution| {
+                    matches!(
+                        execution.status,
+                        WorkflowExecutionStatus::Pending
+                            | WorkflowExecutionStatus::Running
+                            | WorkflowExecutionStatus::Waiting
+                            | WorkflowExecutionStatus::Paused
+                            | WorkflowExecutionStatus::Recompiling
+                    )
+                })
+            {
                 return Some(card_msg_id);
             }
         }
@@ -600,5 +641,201 @@ impl WorkflowOrchestrator {
         let _ = Self::synchronize_runtime_state(pool, execution_id, false).await?;
 
         Ok(interrupted_step)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use db::models::workflow_execution::CreateWorkflowExecution;
+    use sqlx::SqlitePool;
+
+    use super::*;
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory pool");
+        sqlx::query(
+            r#"
+            CREATE TABLE chat_workflow_plans (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                source_message_id TEXT,
+                created_by_session_agent_id TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                title TEXT NOT NULL,
+                summary_text TEXT,
+                plan_json TEXT NOT NULL,
+                plan_schema_version INTEGER NOT NULL,
+                plan_hash TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                validation_errors_json TEXT,
+                workflow_card_message_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec'))
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create plans table");
+        sqlx::query(
+            r#"
+            CREATE TABLE chat_workflow_executions (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                active_revision_id TEXT,
+                active_round_id TEXT,
+                workflow_card_message_id TEXT,
+                lead_session_agent_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                current_round INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                compiled_graph_hash TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                cleaned_at TEXT,
+                cleaned_reason TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec'))
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create executions table");
+        pool
+    }
+
+    async fn create_ready_plan(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        card_message_id: Uuid,
+        title: &str,
+    ) -> WorkflowPlan {
+        let plan = WorkflowPlan::create(
+            pool,
+            &CreateWorkflowPlan {
+                session_id,
+                source_message_id: None,
+                created_by_session_agent_id: None,
+                title: title.to_string(),
+                summary_text: None,
+                plan_json: "{}".to_string(),
+                plan_schema_version: 1,
+                plan_hash: Uuid::new_v4().to_string(),
+                validation_status: WorkflowValidationStatus::Valid,
+                validation_errors_json: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("create plan");
+        let plan = WorkflowPlan::update_status(pool, plan.id, WorkflowPlanStatus::Ready)
+            .await
+            .expect("mark plan ready");
+        WorkflowPlan::update_workflow_card_message_id(pool, plan.id, card_message_id)
+            .await
+            .expect("attach card message")
+    }
+
+    async fn create_execution_with_card(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        plan_id: Uuid,
+        card_message_id: Uuid,
+        status: WorkflowExecutionStatus,
+    ) -> WorkflowExecution {
+        let execution = WorkflowExecution::create(
+            pool,
+            &CreateWorkflowExecution {
+                session_id,
+                plan_id,
+                active_revision_id: None,
+                lead_session_agent_id: None,
+                title: "Execution".to_string(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("create execution");
+        let execution =
+            WorkflowExecution::update_workflow_card_message_id(pool, execution.id, card_message_id)
+                .await
+                .expect("attach execution card");
+        let execution = WorkflowExecution::update_status(pool, execution.id, status.clone())
+            .await
+            .expect("update execution status");
+        if matches!(
+            status,
+            WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
+        ) {
+            WorkflowExecution::set_completed(pool, execution.id)
+                .await
+                .expect("set completed at")
+        } else {
+            execution
+        }
+    }
+
+    #[tokio::test]
+    async fn reusable_workflow_card_returns_preview_card() {
+        let pool = setup_pool().await;
+
+        let session_id = Uuid::new_v4();
+        let card_message_id = Uuid::new_v4();
+        create_ready_plan(&pool, session_id, card_message_id, "Preview").await;
+
+        let found =
+            WorkflowOrchestrator::find_session_workflow_card_message_id(&pool, session_id).await;
+
+        assert_eq!(found, Some(card_message_id));
+    }
+
+    #[tokio::test]
+    async fn reusable_workflow_card_skips_completed_execution_card() {
+        let pool = setup_pool().await;
+
+        let session_id = Uuid::new_v4();
+        let card_message_id = Uuid::new_v4();
+        create_ready_plan(&pool, session_id, card_message_id, "Old preview").await;
+        let completed_plan =
+            create_ready_plan(&pool, session_id, card_message_id, "Completed").await;
+        create_execution_with_card(
+            &pool,
+            session_id,
+            completed_plan.id,
+            card_message_id,
+            WorkflowExecutionStatus::Completed,
+        )
+        .await;
+
+        let found =
+            WorkflowOrchestrator::find_session_workflow_card_message_id(&pool, session_id).await;
+
+        assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn reusable_workflow_card_returns_active_execution_card() {
+        let pool = setup_pool().await;
+
+        let session_id = Uuid::new_v4();
+        let card_message_id = Uuid::new_v4();
+        let plan = create_ready_plan(&pool, session_id, card_message_id, "Active").await;
+        create_execution_with_card(
+            &pool,
+            session_id,
+            plan.id,
+            card_message_id,
+            WorkflowExecutionStatus::Running,
+        )
+        .await;
+
+        let found =
+            WorkflowOrchestrator::find_session_workflow_card_message_id(&pool, session_id).await;
+
+        assert_eq!(found, Some(card_message_id));
     }
 }

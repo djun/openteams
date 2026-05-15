@@ -446,6 +446,10 @@ impl WorkflowStep {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::SqlitePool;
+    use uuid::Uuid;
+
+    use super::{CreateWorkflowStep, WorkflowStep};
     use crate::{
         models::{
             workflow_execution::{CreateWorkflowExecution, WorkflowExecution},
@@ -455,10 +459,6 @@ mod tests {
         },
         run_migrations,
     };
-    use sqlx::SqlitePool;
-    use uuid::Uuid;
-
-    use super::{CreateWorkflowStep, WorkflowStep};
 
     async fn step_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:")
@@ -663,7 +663,10 @@ mod tests {
             .expect("step exists");
         let before_payload: serde_json::Value =
             serde_json::from_str(before.summary_text.as_deref().unwrap()).expect("parse before");
-        assert!(before_payload.get("content").is_some(), "content key should exist before cleanup");
+        assert!(
+            before_payload.get("content").is_some(),
+            "content key should exist before cleanup"
+        );
 
         let cleared = WorkflowStep::clear_content_for_execution(&pool, execution_id)
             .await

@@ -99,6 +99,9 @@
       }
     },
     "mentionAgents": "에이전트 멘션",
+    "chatModeName": "채팅 모드",
+    "workflowModeName": "워크플로 모드",
+    "modeSwitchTooltip": "현재 {{currentMode}}, 클릭하면 {{targetMode}}로 전환됩니다.",
     "switchToFreeMode": "자유 채팅 모드로 전환",
     "switchToWorkflowMode": "워크플로 모드로 전환",
     "freeModeDescription": "자유 채팅 모드: @로 메시지를 멤버에게 라우팅합니다.",

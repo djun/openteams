@@ -1037,7 +1037,7 @@ impl ChatRunner {
         {
             tracing::warn!(
                 session_id = %session_id,
-                "[plan_generation] skipping: running or completed execution already exists"
+                "[plan_generation] skipping: active execution already exists"
             );
 
             self.mark_plan_generation_failed(

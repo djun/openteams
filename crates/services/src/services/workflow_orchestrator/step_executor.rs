@@ -21,8 +21,6 @@ use db::{
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::services::agent_skill_policy::AgentPromptContext;
-
 use super::{
     super::{
         chat_runner::ChatRunner,
@@ -39,6 +37,7 @@ use super::{
     },
     OrchestratorError, StepOutcome, WorkflowOrchestrator, resolve_step_workflow_session,
 };
+use crate::services::agent_skill_policy::AgentPromptContext;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

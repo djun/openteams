@@ -99,6 +99,9 @@
       }
     },
     "mentionAgents": "Mencionar agentes",
+    "chatModeName": "modo chat",
+    "workflowModeName": "modo de flujo de trabajo",
+    "modeSwitchTooltip": "Actualmente en {{currentMode}}, haz clic para cambiar a {{targetMode}}.",
     "switchToFreeMode": "Cambiar a chat libre",
     "switchToWorkflowMode": "Cambiar a modo de flujo de trabajo",
     "freeModeDescription": "Chat libre: usa @ para enrutar mensajes a los miembros.",

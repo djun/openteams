@@ -1310,21 +1310,17 @@ pub fn build_step_execution_prompt(
     let mut prompt = String::with_capacity(4096);
     if step.step_type == WorkflowStepType::Task {
         prompt.push_str("You are implementing a task in an workflow step.\n\n");
-    } else if step.step_type == WorkflowStepType::Review
-    {
+    } else if step.step_type == WorkflowStepType::Review {
         prompt.push_str("You are reviewing the output of the workers' implementation.\n\n");
-    } else if step.step_type == WorkflowStepType::Result
-    {
+    } else if step.step_type == WorkflowStepType::Result {
         prompt.push_str("You are reviewing the results of the current workflow execution.\n\n");
     }
 
     if step.step_type == WorkflowStepType::Task {
         prompt.push_str(STEP_EXECUTION_TDD_WORKFLOW_FOR_TASK_TYPE);
-    } else if step.step_type == WorkflowStepType::Review
-    {
+    } else if step.step_type == WorkflowStepType::Review {
         prompt.push_str(STEP_EXECUTION_TDD_WORKFLOW_FOR_REVIEW_TYPE);
-    } else if step.step_type == WorkflowStepType::Result
-    {
+    } else if step.step_type == WorkflowStepType::Result {
         prompt.push_str(STEP_EXECUTION_RESULT_REVIEW_WORKFLOW);
     }
 

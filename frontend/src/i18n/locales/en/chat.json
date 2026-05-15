@@ -89,6 +89,9 @@
   },
   "input": {
     "mentionAgents": "Mention agents",
+    "chatModeName": "chat mode",
+    "workflowModeName": "workflow mode",
+    "modeSwitchTooltip": "Current {{currentMode}}, click to switch to {{targetMode}}.",
     "switchToFreeMode": "Switch to free chat mode",
     "switchToWorkflowMode": "Switch to workflow mode",
     "freeModeDescription": "Free chat mode: use @ to route messages to members.",
