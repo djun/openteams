@@ -1299,7 +1299,7 @@ impl ChatRunner {
         }
 
         let (plan, revision, workflow_card_message) =
-            WorkflowOrchestrator::create_workflow_plan_preview_card(
+            match WorkflowOrchestrator::create_workflow_plan_preview_card(
                 pool,
                 self,
                 &session,
@@ -1309,9 +1309,27 @@ impl ChatRunner {
                 Some(placeholder.id),
             )
             .await
-            .map_err(|err| {
-                ChatRunnerError::AgentNotFound(format!("plan creation failed: {}", err))
-            })?;
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::error!(
+                        session_id = %session_id,
+                        error = %err,
+                        "[plan_generation] plan preview creation failed"
+                    );
+                    self.mark_plan_generation_failed(
+                        session_id,
+                        placeholder.id,
+                        plan_goal,
+                        &lead_agent_id,
+                        &available_agents,
+                        format!("Plan creation failed: {err}"),
+                        previous_plan_context.as_ref(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
 
         tracing::info!(
             session_id = %session_id,

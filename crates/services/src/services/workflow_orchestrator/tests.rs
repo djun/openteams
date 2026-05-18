@@ -1,6 +1,8 @@
 use chrono::Utc;
 use db::models::{
-    workflow_step::WorkflowStep, workflow_transcript::WorkflowTranscript, workflow_types::*,
+    workflow_execution::WorkflowExecution, workflow_step::WorkflowStep,
+    workflow_step_edge::WorkflowStepEdge, workflow_transcript::WorkflowTranscript,
+    workflow_types::*,
 };
 use uuid::Uuid;
 
@@ -89,6 +91,63 @@ fn sample_step(status: WorkflowStepStatus, summary_text: Option<String>) -> Work
         started_at: None,
         completed_at: None,
     }
+}
+
+fn sample_execution_for_scheduler(active_round_id: Uuid) -> WorkflowExecution {
+    let now = Utc::now();
+    WorkflowExecution {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        plan_id: Uuid::new_v4(),
+        active_revision_id: None,
+        active_round_id: Some(active_round_id),
+        workflow_card_message_id: None,
+        lead_session_agent_id: None,
+        status: WorkflowExecutionStatus::Running,
+        current_round: 1,
+        title: "Execution".to_string(),
+        compiled_graph_hash: None,
+        started_at: Some(now),
+        completed_at: None,
+        cleaned_at: None,
+        cleaned_reason: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[test]
+fn scheduler_edge_repair_skips_compiled_edges_for_missing_materialized_steps() {
+    let round_id = Uuid::new_v4();
+    let execution = sample_execution_for_scheduler(round_id);
+    let mut materialized_step = sample_step(WorkflowStepStatus::Ready, None);
+    materialized_step.execution_id = execution.id;
+    materialized_step.round_id = round_id;
+    materialized_step.step_key = "data_balance_config".to_string();
+
+    let compiled_graph = CompiledGraph {
+        plan_hash: "plan".to_string(),
+        compiled_graph_hash: "graph".to_string(),
+        steps: Vec::new(),
+        edges: vec![CompiledEdge {
+            edge_id: "edge-1".to_string(),
+            from_step_key: "data_setup".to_string(),
+            to_step_key: "data_balance_config".to_string(),
+            edge_kind: WorkflowEdgeKind::Hard,
+        }],
+        ready_step_keys: Vec::new(),
+        loops: None,
+    };
+
+    let repaired = WorkflowOrchestrator::scheduler_step_edges_from_compiled(
+        &execution,
+        &[materialized_step],
+        &Vec::<WorkflowStepEdge>::new(),
+        &compiled_graph,
+    )
+    .expect("missing materialized compiled edge steps should be skipped");
+
+    assert!(repaired.is_empty());
 }
 
 #[test]
@@ -198,7 +257,6 @@ fn completed_like_final_review_invariant_requires_only_completed_terminal_steps(
     let steps = vec![
         sample_step(WorkflowStepStatus::Completed, None),
         sample_step(WorkflowStepStatus::Skipped, None),
-        sample_step(WorkflowStepStatus::Cancelled, None),
     ];
     assert!(WorkflowOrchestrator::all_steps_completed_like(&steps));
 
@@ -271,14 +329,14 @@ fn step_transition_duration_reports_terminal_elapsed_time() {
 }
 
 #[test]
-fn step_transition_duration_uses_updated_at_fallback_for_cancelled() {
+fn step_transition_duration_uses_updated_at_fallback_for_failed() {
     let mut step = sample_step(WorkflowStepStatus::Running, None);
     step.started_at = Some(Utc::now());
     step.updated_at =
         step.started_at.expect("started_at set") + chrono::Duration::milliseconds(1800);
     step.completed_at = None;
 
-    let duration_ms = step_transition_duration_ms(&step, "cancelled");
+    let duration_ms = step_transition_duration_ms(&step, "failed");
     assert_eq!(duration_ms, Some(1800));
 }
 

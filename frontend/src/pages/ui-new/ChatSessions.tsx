@@ -130,6 +130,10 @@ import {
   WorkflowReviewSettingsDialog,
   type WorkflowReviewSettingOverride,
 } from './chat/components/WorkflowReviewSettingsDialog';
+import {
+  canRetryWorkflowStepReview,
+  isRetryableWorkflowStepStatus,
+} from './chat/components/workflowControlContract';
 import { toWorkflowFinalReviewAction } from './chat/components/WorkflowFinalReviewCard';
 import { ChatSystemMessage } from '@/components/ui-new/primitives/conversation/ChatSystemMessage';
 import { useToast } from '@/components/ui-new/containers/ToastContainer';
@@ -158,6 +162,8 @@ const toSessionChatInputMode = (mode: ChatInputMode): string | null =>
 
 const WORKFLOW_CARD_ACTION_REFRESH_WINDOW_MS = 30_000;
 
+type WorkflowStepRetryTarget = 'task' | 'review';
+
 function getWorkflowProjectionCurrentRoundSteps(
   projection: WorkflowCardProjection
 ) {
@@ -166,6 +172,19 @@ function getWorkflowProjectionCurrentRoundSteps(
       (graph) => graph.round_index === projection.current_round
     )?.steps ?? projection.steps
   );
+}
+
+function getWorkflowResumeRetryTargets(
+  projection?: WorkflowCardProjection
+): Array<{ stepId: string; retryTarget: WorkflowStepRetryTarget }> {
+  if (!projection) return [];
+
+  return getWorkflowProjectionCurrentRoundSteps(projection)
+    .filter((step) => isRetryableWorkflowStepStatus(step.status))
+    .map((step) => ({
+      stepId: step.id,
+      retryTarget: canRetryWorkflowStepReview(step) ? 'review' : 'task',
+    }));
 }
 
 function shouldConfirmReviewSettingsBeforeRoundStart(
@@ -184,6 +203,147 @@ function shouldConfirmReviewSettingsBeforeRoundStart(
     currentRoundSteps.every(
       (step) => step.status === 'pending' || step.status === 'ready'
     )
+  );
+}
+
+function patchWorkflowProjectionExecutionStatus(
+  projection: WorkflowCardProjection,
+  status: string
+): WorkflowCardProjection {
+  const isRunning = status === 'running';
+  const isTerminal =
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'canceled';
+  const shouldClearPending = isRunning || isTerminal;
+
+  return {
+    ...projection,
+    state: status,
+    execution_status: status,
+    error_message: isRunning ? null : projection.error_message,
+    is_terminal: isRunning
+      ? false
+      : isTerminal
+        ? true
+        : projection.is_terminal,
+    pending_review: shouldClearPending ? null : projection.pending_review,
+    pending_input: shouldClearPending ? null : projection.pending_input,
+  };
+}
+
+function patchWorkflowPlanNodeStatus(
+  plan: WorkflowCardProjection['plan'],
+  stepKey: string,
+  status: string
+): WorkflowCardProjection['plan'] {
+  let changed = false;
+  const nodes = plan.nodes.map((node) => {
+    if (node.id !== stepKey) {
+      return node;
+    }
+    changed = true;
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        status,
+      },
+    };
+  });
+
+  return changed ? { ...plan, nodes } : plan;
+}
+
+function patchWorkflowStepsStatus(
+  steps: WorkflowCardProjection['steps'],
+  stepId: string,
+  status: string
+) {
+  let changed = false;
+  let stepKey: string | null = null;
+  const nextSteps = steps.map((step) => {
+    if (step.id !== stepId) {
+      return step;
+    }
+    changed = true;
+    stepKey = step.step_key;
+    return {
+      ...step,
+      status,
+    };
+  });
+
+  return { changed, steps: changed ? nextSteps : steps, stepKey };
+}
+
+function workflowProjectionContainsStep(
+  projection: WorkflowCardProjection,
+  stepId: string
+): boolean {
+  return (
+    projection.steps.some((step) => step.id === stepId) ||
+    (projection.round_graphs?.some((graph) =>
+      graph.steps.some((step) => step.id === stepId)
+    ) ??
+      false)
+  );
+}
+
+function patchWorkflowProjectionStepStatus(
+  projection: WorkflowCardProjection,
+  stepId: string,
+  stepStatus: string,
+  executionStatus: string
+): WorkflowCardProjection {
+  const topLevelPatch = patchWorkflowStepsStatus(
+    projection.steps,
+    stepId,
+    stepStatus
+  );
+  let changed = topLevelPatch.changed;
+  const topLevelPlan = topLevelPatch.stepKey
+    ? patchWorkflowPlanNodeStatus(
+        projection.plan,
+        topLevelPatch.stepKey,
+        stepStatus
+      )
+    : projection.plan;
+
+  const roundGraphs = projection.round_graphs?.map((graph) => {
+    const graphPatch = patchWorkflowStepsStatus(graph.steps, stepId, stepStatus);
+    if (!graphPatch.changed) {
+      return graph;
+    }
+
+    changed = true;
+    return {
+      ...graph,
+      status: executionStatus,
+      steps: graphPatch.steps,
+      plan: graphPatch.stepKey
+        ? patchWorkflowPlanNodeStatus(
+            graph.plan,
+            graphPatch.stepKey,
+            stepStatus
+          )
+        : graph.plan,
+    };
+  });
+
+  if (!changed) {
+    return projection;
+  }
+
+  return patchWorkflowProjectionExecutionStatus(
+    {
+      ...projection,
+      steps: topLevelPatch.steps,
+      plan: topLevelPlan,
+      round_graphs: roundGraphs,
+    },
+    executionStatus
   );
 }
 
@@ -829,7 +989,7 @@ export function ChatSessions() {
   >({});
   const activeChatInputMode: ChatInputMode = activeSessionId
     ? (chatInputModeBySessionId[activeSessionId] ??
-      resolveChatInputMode(activeSession?.chat_input_mode))
+        resolveChatInputMode(activeSession?.chat_input_mode))
     : DEFAULT_CHAT_INPUT_MODE;
   const isWorkflowInputMode = activeChatInputMode === 'workflow';
   const visibleMessagesData = useMemo(() => messagesData, [messagesData]);
@@ -884,6 +1044,20 @@ export function ChatSessions() {
   ] = useState<WorkflowCardProjection | null>(null);
   const [pendingRoundStartReviewSettings, setPendingRoundStartReviewSettings] =
     useState<{ executionId: string; roundIndex: number } | null>(null);
+  const [workflowWindowOpen, setWorkflowWindowOpen] = useState(false);
+  const [workflowWindowCardMessageId, setWorkflowWindowCardMessageId] =
+    useState<string | null>(null);
+  const [
+    workflowWindowFallbackProjection,
+    setWorkflowWindowFallbackProjection,
+  ] = useState<WorkflowWindowProjection | null>(null);
+  const [workflowCardRefreshNonce, setWorkflowCardRefreshNonce] = useState(0);
+  const [
+    workflowCardProjectionByMessageId,
+    setWorkflowCardProjectionByMessageId,
+  ] = useState<Record<string, WorkflowCardProjection>>({});
+  const workflowCardRefreshNonceRef = useRef(workflowCardRefreshNonce);
+  const workflowCardForceRefreshUntilMsRef = useRef(0);
   const upsertMessage = useCallback(
     (message: ChatMessage) => {
       setMessages((prev) => {
@@ -914,6 +1088,62 @@ export function ChatSessions() {
       );
     },
     [queryClient]
+  );
+
+  const optimisticallyPatchWorkflowProjections = useCallback(
+    (
+      predicate: (projection: WorkflowCardProjection) => boolean,
+      updater: (projection: WorkflowCardProjection) => WorkflowCardProjection
+    ) => {
+      workflowCardForceRefreshUntilMsRef.current = Math.max(
+        workflowCardForceRefreshUntilMsRef.current,
+        Date.now() + WORKFLOW_CARD_ACTION_REFRESH_WINDOW_MS
+      );
+      setWorkflowCardProjectionByMessageId((prev) => {
+        const next: Record<string, WorkflowCardProjection> = {};
+        let changed = false;
+
+        for (const message of messages) {
+          if (!isWorkflowCardMessageMeta(message.meta)) {
+            continue;
+          }
+          const projection =
+            prev[message.id] ?? extractWorkflowCardProjection(message.meta);
+          if (!projection) {
+            continue;
+          }
+          const updated = predicate(projection)
+            ? updater(projection)
+            : projection;
+          next[message.id] = updated;
+          if (updated !== projection || prev[message.id] !== projection) {
+            changed = true;
+          }
+        }
+
+        for (const [messageId, projection] of Object.entries(prev)) {
+          if (next[messageId]) {
+            continue;
+          }
+          const updated = predicate(projection)
+            ? updater(projection)
+            : projection;
+          next[messageId] = updated;
+          if (updated !== projection) {
+            changed = true;
+          }
+        }
+
+        return changed ? next : prev;
+      });
+      setWorkflowWindowFallbackProjection((prev) =>
+        prev && predicate(prev)
+          ? (updater(prev) as WorkflowWindowProjection)
+          : prev
+      );
+      setWorkflowCardRefreshNonce((prev) => prev + 1);
+    },
+    [messages]
   );
 
   const upsertWorkItem = useCallback(
@@ -951,6 +1181,15 @@ export function ChatSessions() {
     (message: ChatMessage) => {
       console.info('message --- ' + JSON.stringify(message));
       upsertMessage(message);
+      const incomingWorkflowProjection = extractWorkflowCardProjection(
+        message.meta
+      );
+      if (incomingWorkflowProjection) {
+        setWorkflowCardProjectionByMessageId((prev) => ({
+          ...prev,
+          [message.id]: incomingWorkflowProjection,
+        }));
+      }
       if (isProtocolErrorMessage(message)) return;
 
       const notifications = notificationsRef.current;
@@ -1128,6 +1367,41 @@ export function ChatSessions() {
         stepReviewOverrides: overrides,
       });
     },
+    onMutate: () => {
+      workflowCardForceRefreshUntilMsRef.current = Math.max(
+        workflowCardForceRefreshUntilMsRef.current,
+        Date.now() + WORKFLOW_CARD_ACTION_REFRESH_WINDOW_MS
+      );
+      setWorkflowCardRefreshNonce((prev) => prev + 1);
+    },
+    onSuccess: (data, variables) => {
+      if (!activeSessionId) return;
+      queryClient.invalidateQueries({
+        queryKey: ['chatMessages', activeSessionId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ['workflowTranscripts', activeSessionId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ['workflowStepTranscripts', activeSessionId],
+      });
+      workflowCardForceRefreshUntilMsRef.current = Math.max(
+        workflowCardForceRefreshUntilMsRef.current,
+        Date.now() + WORKFLOW_CARD_ACTION_REFRESH_WINDOW_MS
+      );
+      recordWorkflowEvent(
+        'workflow.execution_state_changed',
+        {
+          session_id: activeSessionId,
+          workflow_id: data.execution_id,
+          plan_id: variables.planId,
+        },
+        {
+          status: 'running',
+        }
+      );
+      setWorkflowCardRefreshNonce((prev) => prev + 1);
+    },
     onError: (error) => showRequestError(error, 'Execute plan failed'),
   });
   const {
@@ -1175,6 +1449,13 @@ export function ChatSessions() {
     mutationFn: async (executionId: string) => {
       if (!activeSessionId) throw new Error('No active session');
       return chatApi.pauseAll(activeSessionId, executionId);
+    },
+    onMutate: (executionId) => {
+      optimisticallyPatchWorkflowProjections(
+        (projection) => projection.execution_id === executionId,
+        (projection) =>
+          patchWorkflowProjectionExecutionStatus(projection, 'paused')
+      );
     },
     onSuccess: (_data, executionId) => {
       if (!activeSessionId) return;
@@ -1275,6 +1556,18 @@ export function ChatSessions() {
       if (!activeSessionId) throw new Error('No active session');
       return chatApi.interruptWorkflowStep(activeSessionId, stepId);
     },
+    onMutate: ({ stepId }) => {
+      optimisticallyPatchWorkflowProjections(
+        (projection) => workflowProjectionContainsStep(projection, stepId),
+        (projection) =>
+          patchWorkflowProjectionStepStatus(
+            projection,
+            stepId,
+            'interrupted',
+            'cancelled'
+          )
+      );
+    },
     onSuccess: () => {
       if (!activeSessionId) return;
       queryClient.invalidateQueries({
@@ -1304,6 +1597,18 @@ export function ChatSessions() {
       if (!activeSessionId) throw new Error('No active session');
       return chatApi.stopWorkflowStep(activeSessionId, stepId);
     },
+    onMutate: (stepId) => {
+      optimisticallyPatchWorkflowProjections(
+        (projection) => workflowProjectionContainsStep(projection, stepId),
+        (projection) =>
+          patchWorkflowProjectionStepStatus(
+            projection,
+            stepId,
+            'interrupted',
+            'cancelled'
+          )
+      );
+    },
     onSuccess: () => {
       if (!activeSessionId) return;
       queryClient.invalidateQueries({
@@ -1321,11 +1626,18 @@ export function ChatSessions() {
   });
 
   const resumeWorkflowMutation = useMutation({
-    mutationFn: async (executionId: string) => {
+    mutationFn: async ({ executionId }: { executionId: string }) => {
       if (!activeSessionId) throw new Error('No active session');
       return chatApi.resumeWorkflowExecution(activeSessionId, executionId);
     },
-    onSuccess: (_data, executionId) => {
+    onMutate: ({ executionId }) => {
+      optimisticallyPatchWorkflowProjections(
+        (projection) => projection.execution_id === executionId,
+        (projection) =>
+          patchWorkflowProjectionExecutionStatus(projection, 'running')
+      );
+    },
+    onSuccess: (_data, { executionId }) => {
       if (!activeSessionId) return;
       recordWorkflowEvent(
         'workflow.execution_state_changed',
@@ -1346,24 +1658,14 @@ export function ChatSessions() {
       queryClient.invalidateQueries({
         queryKey: ['workflowStepTranscripts', activeSessionId],
       });
+      workflowCardForceRefreshUntilMsRef.current = Math.max(
+        workflowCardForceRefreshUntilMsRef.current,
+        Date.now() + WORKFLOW_CARD_ACTION_REFRESH_WINDOW_MS
+      );
       setWorkflowCardRefreshNonce((prev) => prev + 1);
     },
     onError: (error) => showRequestError(error, 'Resume workflow failed'),
   });
-
-  const handleResumeWorkflowExecution = useCallback(
-    (executionId: string, projection?: WorkflowCardProjection) => {
-      if (
-        projection &&
-        shouldConfirmReviewSettingsBeforeRoundStart(projection)
-      ) {
-        setRoundStartReviewSettingsProjection(projection);
-        return;
-      }
-      resumeWorkflowMutation.mutate(executionId);
-    },
-    [resumeWorkflowMutation]
-  );
 
   const handleCloseRoundStartReviewSettings = useCallback(() => {
     if (
@@ -1387,7 +1689,7 @@ export function ChatSessions() {
         executionId,
         overrides,
       });
-      await resumeWorkflowMutation.mutateAsync(executionId);
+      await resumeWorkflowMutation.mutateAsync({ executionId });
       setRoundStartReviewSettingsProjection(null);
     },
     [
@@ -1485,12 +1787,17 @@ export function ChatSessions() {
       );
       return chatApi.retryWorkflowStep(activeSessionId, stepId, retryTarget);
     },
-    onMutate: () => {
-      workflowCardForceRefreshUntilMsRef.current = Math.max(
-        workflowCardForceRefreshUntilMsRef.current,
-        Date.now() + WORKFLOW_CARD_ACTION_REFRESH_WINDOW_MS
+    onMutate: ({ stepId }) => {
+      optimisticallyPatchWorkflowProjections(
+        (projection) => workflowProjectionContainsStep(projection, stepId),
+        (projection) =>
+          patchWorkflowProjectionStepStatus(
+            projection,
+            stepId,
+            'running',
+            'running'
+          )
       );
-      setWorkflowCardRefreshNonce((prev) => prev + 1);
     },
     onSuccess: () => {
       if (!activeSessionId) return;
@@ -1511,6 +1818,28 @@ export function ChatSessions() {
     },
     onError: (error) => showRequestError(error, 'Retry step failed'),
   });
+
+  const handleResumeWorkflowExecution = useCallback(
+    (executionId: string, projection?: WorkflowCardProjection) => {
+      const retryTargets = getWorkflowResumeRetryTargets(projection);
+      if (retryTargets.length > 0) {
+        for (const retryTarget of retryTargets) {
+          retryWorkflowStepMutation.mutate(retryTarget);
+        }
+        return;
+      }
+
+      if (
+        projection &&
+        shouldConfirmReviewSettingsBeforeRoundStart(projection)
+      ) {
+        setRoundStartReviewSettingsProjection(projection);
+        return;
+      }
+      resumeWorkflowMutation.mutate({ executionId });
+    },
+    [resumeWorkflowMutation, retryWorkflowStepMutation]
+  );
 
   const submitWorkflowStepInputMutation = useMutation({
     mutationFn: async ({
@@ -1555,22 +1884,6 @@ export function ChatSessions() {
     },
     onError: (error) => showRequestError(error, 'Submit step input failed'),
   });
-
-  // Workflow window state
-  const [workflowWindowOpen, setWorkflowWindowOpen] = useState(false);
-  const [workflowWindowCardMessageId, setWorkflowWindowCardMessageId] =
-    useState<string | null>(null);
-  const [
-    workflowWindowFallbackProjection,
-    setWorkflowWindowFallbackProjection,
-  ] = useState<WorkflowWindowProjection | null>(null);
-  const [workflowCardRefreshNonce, setWorkflowCardRefreshNonce] = useState(0);
-  const [
-    workflowCardProjectionByMessageId,
-    setWorkflowCardProjectionByMessageId,
-  ] = useState<Record<string, WorkflowCardProjection>>({});
-  const workflowCardRefreshNonceRef = useRef(workflowCardRefreshNonce);
-  const workflowCardForceRefreshUntilMsRef = useRef(0);
 
   useEffect(() => {
     setWorkflowCardProjectionByMessageId({});
@@ -1642,18 +1955,19 @@ export function ChatSessions() {
       });
     };
 
-    const shouldForceRefresh =
-      workflowCardRefreshNonceRef.current !== workflowCardRefreshNonce ||
+    const shouldRefreshImmediately =
+      workflowCardRefreshNonceRef.current !== workflowCardRefreshNonce;
+    const shouldForcePoll =
       Date.now() < workflowCardForceRefreshUntilMsRef.current;
     workflowCardRefreshNonceRef.current = workflowCardRefreshNonce;
-    const initialMessageIds = shouldForceRefresh
+    const initialMessageIds = shouldRefreshImmediately
       ? workflowCardMessageIds
       : workflowCardMessageIds.filter(
           (messageId) => !workflowCardProjectionForRefreshByMessageId[messageId]
         );
     void refreshWorkflowCards(initialMessageIds);
 
-    const refetchInterval = shouldForceRefresh
+    const refetchInterval = shouldForcePoll
       ? WORKFLOW_CARD_REFETCH_INTERVAL_MS
       : getWorkflowCardRefetchInterval(
           workflowCardMessageIds.map(
@@ -3833,7 +4147,7 @@ export function ChatSessions() {
         );
       }
     },
-    [activeSessionId, handleLoadDiff, queryClient, recordWorkflowEvent]
+    [activeSessionId, handleLoadDiff, queryClient]
   );
 
   // Determine if there are new unseen changes

@@ -44,6 +44,7 @@ import {
   toWorkflowFinalReviewAction,
 } from './WorkflowFinalReviewCard';
 import {
+  canRetryWorkflowStepReview,
   canPauseWorkflowExecution,
   canResumeWorkflowExecution,
   isRetryableWorkflowStepStatus,
@@ -97,13 +98,8 @@ type WorkflowTranscriptSummaryPayload = {
 const WORKFLOW_FAILURE_STEP_STATUSES = new Set([
   'failed',
   'interrupted',
-  'cancelled',
 ]);
-const REVIEW_READY_STEP_STATUSES = new Set([
-  'completed',
-  'skipped',
-  'cancelled',
-]);
+const REVIEW_READY_STEP_STATUSES = new Set(['completed', 'skipped']);
 const WORKFLOW_REVIEW_ENTRY_TYPES = new Set([
   'lead_review',
   'step_review',
@@ -741,10 +737,7 @@ function InspectorCard({
   const isCompleted = step.status === 'completed';
   const hasError = isFailed;
   const leadReviewRequired = step.lead_review_required;
-  const canRetryReviewStep =
-    leadReviewRequired &&
-    !!step.latest_review &&
-    isRetryableWorkflowStepStatus(step.status);
+  const canRetryReviewStep = canRetryWorkflowStepReview(step);
   const hasFooterActions =
     step.status === 'running' ||
     step.status === 'waiting_review' ||
@@ -2330,29 +2323,16 @@ export function WorkflowWindow({
                 <Pause className="w-4 h-4" />
               </button>
             )}
-            {projection.execution_id &&
-              (onInterruptStep || onStopStep) &&
-              isRunning && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const runningStep = projection.steps.find(
-                      (s) =>
-                        s.status === 'running' ||
-                        s.status === 'waiting_review' ||
-                        s.status === 'waiting_input'
-                    );
-                    if (runningStep) {
-                      if (onInterruptStep) onInterruptStep(runningStep.id);
-                      else onStopStep?.(runningStep.id);
-                    }
-                  }}
-                  className="p-1.5 hover:bg-white hover:shadow-sm rounded-md transition-all text-slate-500"
-                  title={t('workflow.controls.stop', { defaultValue: 'Stop' })}
-                >
-                  <Square className="w-4 h-4" />
-                </button>
-              )}
+            {projection.execution_id && onPauseAll && isRunning && (
+              <button
+                type="button"
+                onClick={() => onPauseAll(projection.execution_id!)}
+                className="p-1.5 hover:bg-white hover:shadow-sm rounded-md transition-all text-slate-500"
+                title={t('workflow.controls.stop', { defaultValue: 'Stop' })}
+              >
+                <Square className="w-4 h-4" />
+              </button>
+            )}
           </div>
           {projection.execution_id && onUpdateReviewSettings && (
             <button

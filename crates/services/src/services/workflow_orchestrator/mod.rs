@@ -121,6 +121,8 @@ pub(crate) enum StepOutcome {
     Completed,
     /// Step parked waiting for user action (approval/permission/continue/input)
     Parked,
+    /// Step was intentionally interrupted by user control.
+    Interrupted,
     /// Step failed with the given error message
     Failed(String),
 }
@@ -1033,6 +1035,10 @@ impl WorkflowOrchestrator {
                         outcome: StepOutcome::Parked,
                         ..
                     }
+                    | SchedulerWorkOutcome::Step {
+                        outcome: StepOutcome::Interrupted,
+                        ..
+                    }
                     | SchedulerWorkOutcome::Loop(LoopOutcome::Parked) => {
                         any_parked = true;
                     }
@@ -1253,9 +1259,7 @@ impl WorkflowOrchestrator {
         }
         if matches!(
             to,
-            WorkflowExecutionStatus::Completed
-                | WorkflowExecutionStatus::Failed
-                | WorkflowExecutionStatus::Cancelled
+            WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
         ) && transitioned.completed_at.is_none()
         {
             transitioned = WorkflowExecution::set_completed(pool, transitioned.id).await?;
@@ -1529,22 +1533,25 @@ impl WorkflowOrchestrator {
 
         let mut repaired = edges.to_vec();
         for compiled_edge in &compiled_graph.edges {
-            let from_step_id = *step_id_by_key
-                .get(compiled_edge.from_step_key.as_str())
-                .ok_or_else(|| {
-                    OrchestratorError::NotFound(format!(
-                        "compiled edge source step {} not found for execution {}",
-                        compiled_edge.from_step_key, execution.id
-                    ))
-                })?;
-            let to_step_id = *step_id_by_key
-                .get(compiled_edge.to_step_key.as_str())
-                .ok_or_else(|| {
-                    OrchestratorError::NotFound(format!(
-                        "compiled edge target step {} not found for execution {}",
-                        compiled_edge.to_step_key, execution.id
-                    ))
-                })?;
+            let Some(&from_step_id) = step_id_by_key.get(compiled_edge.from_step_key.as_str())
+            else {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    from_step = %compiled_edge.from_step_key,
+                    to_step = %compiled_edge.to_step_key,
+                    "skipping compiled workflow edge because source step is not materialized"
+                );
+                continue;
+            };
+            let Some(&to_step_id) = step_id_by_key.get(compiled_edge.to_step_key.as_str()) else {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    from_step = %compiled_edge.from_step_key,
+                    to_step = %compiled_edge.to_step_key,
+                    "skipping compiled workflow edge because target step is not materialized"
+                );
+                continue;
+            };
             let edge_kind = to_workflow_wire_value(&compiled_edge.edge_kind);
             let key = (from_step_id, to_step_id, edge_kind);
             if existing.contains(&key) {
@@ -1682,7 +1689,7 @@ impl WorkflowOrchestrator {
 // -----------------------------------------------------------------------
 
 fn step_transition_duration_ms(step: &WorkflowStep, to_status: &str) -> Option<i64> {
-    if !matches!(to_status, "completed" | "failed" | "cancelled" | "skipped") {
+    if !matches!(to_status, "completed" | "failed" | "skipped") {
         return None;
     }
 

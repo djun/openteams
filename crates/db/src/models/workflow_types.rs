@@ -100,7 +100,6 @@ pub enum WorkflowExecutionStatus {
     Pending,
     Running,
     Failed,
-    Cancelled,
     Paused,
     Recompiling,
     Completed,
@@ -161,7 +160,6 @@ pub enum WorkflowStepStatus {
     Completed,
     Failed,
     Skipped,
-    Cancelled,
 }
 
 #[derive(Debug, Clone, Type, Serialize, Deserialize, PartialEq, TS)]

@@ -51,93 +51,64 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn add_cancelled_status_migration_preserves_child_foreign_keys() {
+    async fn repair_removed_cancelled_migration_restores_child_fk_targets() {
         let pool = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("create sqlite memory pool");
 
         sqlx::raw_sql(
             r#"
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE chat_workflow_plans (
-                id BLOB NOT NULL PRIMARY KEY
-            );
-
-            CREATE TABLE chat_workflow_plan_revisions (
-                id BLOB NOT NULL PRIMARY KEY
-            );
+            PRAGMA foreign_keys = OFF;
 
             CREATE TABLE chat_workflow_executions (
-                id                       BLOB    NOT NULL PRIMARY KEY,
-                session_id               BLOB    NOT NULL,
-                plan_id                  BLOB    NOT NULL REFERENCES chat_workflow_plans(id),
-                active_revision_id       BLOB    REFERENCES chat_workflow_plan_revisions(id),
-                active_round_id          BLOB,
-                workflow_card_message_id BLOB,
-                lead_session_agent_id    BLOB,
-                status                   TEXT    NOT NULL DEFAULT 'pending'
-                                                 CHECK (status IN (
-                                                     'pending', 'running', 'failed', 'paused',
-                                                     'recompiling', 'completed', 'waiting'
-                                                 )),
-                current_round            INTEGER NOT NULL DEFAULT 0,
-                title                    TEXT    NOT NULL DEFAULT '',
-                compiled_graph_hash      TEXT,
-                started_at               TEXT,
-                completed_at             TEXT,
-                cleaned_at               TEXT,
-                cleaned_reason           TEXT,
-                created_at               TEXT    NOT NULL DEFAULT (datetime('now', 'subsec')),
-                updated_at               TEXT    NOT NULL DEFAULT (datetime('now', 'subsec'))
+                id BLOB NOT NULL PRIMARY KEY
             );
 
             CREATE TABLE chat_workflow_steps (
-                id           BLOB NOT NULL PRIMARY KEY,
-                execution_id BLOB NOT NULL REFERENCES chat_workflow_executions(id)
+                id BLOB NOT NULL PRIMARY KEY,
+                execution_id BLOB NOT NULL REFERENCES "chat_workflow_executions_old"(id)
             );
 
-            INSERT INTO chat_workflow_plans(id) VALUES (x'01');
-            INSERT INTO chat_workflow_executions(id, session_id, plan_id, status, title)
-            VALUES (x'02', x'03', x'01', 'failed', 'existing');
-            INSERT INTO chat_workflow_steps(id, execution_id) VALUES (x'04', x'02');
+            CREATE TABLE chat_workflow_transcripts (
+                id BLOB NOT NULL PRIMARY KEY,
+                step_id BLOB REFERENCES "chat_workflow_steps_old"(id)
+            );
             "#,
         )
         .execute(&pool)
         .await
-        .expect("seed pre-migration workflow tables");
+        .expect("seed broken foreign-key references");
 
         let mut tx = pool.begin().await.expect("begin sqlx migration wrapper");
         sqlx::raw_sql(include_str!(
-            "../../migrations/20260516123000_add_cancelled_workflow_execution_status.sql"
+            "../../migrations/20260518143000_repair_removed_cancelled_workflow_fk_refs.sql"
         ))
         .execute(&mut *tx)
         .await
-        .expect("run cancelled status migration");
+        .expect("run repair migration");
         tx.commit().await.expect("commit sqlx migration wrapper");
 
-        let fk_violations =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
-                .fetch_one(&pool)
-                .await
-                .expect("run foreign key check");
-        assert_eq!(fk_violations, 0);
-
-        let foreign_keys = sqlx::query("PRAGMA foreign_key_list(chat_workflow_steps)")
+        let step_fks = sqlx::query("PRAGMA foreign_key_list(chat_workflow_steps)")
             .fetch_all(&pool)
             .await
             .expect("read workflow step foreign keys");
-        let execution_fk_table = foreign_keys
+        let execution_fk_table = step_fks
             .iter()
             .find(|row| row.get::<String, _>("from") == "execution_id")
             .map(|row| row.get::<String, _>("table"))
             .expect("workflow step execution_id foreign key");
         assert_eq!(execution_fk_table, "chat_workflow_executions");
 
-        sqlx::query("UPDATE chat_workflow_executions SET status = 'cancelled' WHERE id = x'02'")
-            .execute(&pool)
+        let transcript_fks = sqlx::query("PRAGMA foreign_key_list(chat_workflow_transcripts)")
+            .fetch_all(&pool)
             .await
-            .expect("cancelled status is allowed");
+            .expect("read workflow transcript foreign keys");
+        let step_fk_table = transcript_fks
+            .iter()
+            .find(|row| row.get::<String, _>("from") == "step_id")
+            .map(|row| row.get::<String, _>("table"))
+            .expect("workflow transcript step_id foreign key");
+        assert_eq!(step_fk_table, "chat_workflow_steps");
     }
 
     async fn create_execution_with_status(
@@ -181,9 +152,7 @@ mod tests {
 
         let is_terminal = matches!(
             status,
-            WorkflowExecutionStatus::Completed
-                | WorkflowExecutionStatus::Failed
-                | WorkflowExecutionStatus::Cancelled
+            WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
         );
         let execution = WorkflowExecution::update_status(pool, execution.id, status)
             .await
@@ -214,7 +183,6 @@ mod tests {
             WorkflowExecutionStatus::Recompiling,
             WorkflowExecutionStatus::Completed,
             WorkflowExecutionStatus::Failed,
-            WorkflowExecutionStatus::Cancelled,
         ] {
             create_execution_with_status(&pool, session_id, status).await;
         }
@@ -250,9 +218,6 @@ mod tests {
             create_execution_with_status(&pool, session_id, WorkflowExecutionStatus::Running).await;
         let failed =
             create_execution_with_status(&pool, session_id, WorkflowExecutionStatus::Failed).await;
-        let cancelled =
-            create_execution_with_status(&pool, session_id, WorkflowExecutionStatus::Cancelled)
-                .await;
 
         let cutoff = Utc::now() + chrono::Duration::days(1);
         let found = WorkflowExecution::find_completed_before(&pool, &cutoff)
@@ -261,7 +226,6 @@ mod tests {
         let found_ids: Vec<Uuid> = found.iter().map(|e| e.id).collect();
         assert!(found_ids.contains(&completed.id));
         assert!(found_ids.contains(&failed.id));
-        assert!(found_ids.contains(&cancelled.id));
         assert!(!found_ids.contains(&_running.id));
 
         WorkflowExecution::mark_cleaned(&pool, completed.id, "test")
@@ -274,7 +238,6 @@ mod tests {
         let cleaned_ids: Vec<Uuid> = found_after_clean.iter().map(|e| e.id).collect();
         assert!(!cleaned_ids.contains(&completed.id));
         assert!(cleaned_ids.contains(&failed.id));
-        assert!(cleaned_ids.contains(&cancelled.id));
     }
 
     #[tokio::test]
@@ -598,7 +561,7 @@ impl WorkflowExecution {
             .format("%Y-%m-%d %H:%M:%S%.f")
             .to_string();
         sqlx::query_as::<_, Self>(&format!(
-            "{EXECUTION_SELECT}\nWHERE status IN ('completed', 'failed', 'cancelled') AND datetime(COALESCE(completed_at, updated_at)) < datetime(?1) AND cleaned_at IS NULL\nORDER BY datetime(COALESCE(completed_at, updated_at)) ASC"
+            "{EXECUTION_SELECT}\nWHERE status IN ('completed', 'failed') AND datetime(COALESCE(completed_at, updated_at)) < datetime(?1) AND cleaned_at IS NULL\nORDER BY datetime(COALESCE(completed_at, updated_at)) ASC"
         ))
         .bind(cutoff)
         .fetch_all(pool)

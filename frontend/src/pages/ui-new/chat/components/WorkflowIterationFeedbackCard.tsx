@@ -390,7 +390,7 @@ export function WorkflowIterationFeedbackCard({
                 type="button"
                 onClick={handleAccept}
                 disabled={disabled || !canSubmit}
-                className="flex-1 bg-[#5094fb] border border-[#5094fb] text-white py-2.5 rounded-xl text-xs font-bold hover:bg-[#4080e0] hover:border-[#4080e0] transition-all active:scale-95 disabled:opacity-50 disabled:active:scale-100 shadow-sm"
+                className="flex-1 bg-[#2563eb] border border-[#2563eb] text-white py-2.5 rounded-xl text-xs font-bold hover:bg-[#1d4ed8] hover:border-[#1d4ed8] transition-all active:scale-95 disabled:opacity-50 disabled:active:scale-100 shadow-sm"
               >
                 {t('workflow.iterationFeedback.accept', {
                   defaultValue: 'ACCEPT',

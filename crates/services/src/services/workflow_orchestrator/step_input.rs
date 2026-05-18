@@ -321,8 +321,8 @@ impl WorkflowOrchestrator {
                         pool,
                         chat_runner,
                         active_execution.id,
-                        Some(reason.clone()),
-                        "step_input_failed",
+                        None,
+                        "step_input_interrupted",
                         vec![running_step.id.to_string()],
                     )
                     .await?;
@@ -405,7 +405,7 @@ impl WorkflowOrchestrator {
                     )
                     .await?
                 }
-                super::StepOutcome::Parked => {
+                super::StepOutcome::Parked | super::StepOutcome::Interrupted => {
                     Self::refresh_execution_projection_with_reason(
                         pool,
                         chat_runner,

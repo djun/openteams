@@ -218,7 +218,7 @@ impl WorkflowOrchestrator {
                 Self::finalize_single_step_retry_completion(pool, chat_runner, execution, step.id)
                     .await
             }
-            StepOutcome::Parked => {
+            StepOutcome::Parked | StepOutcome::Interrupted => {
                 let waiting_execution =
                     Self::synchronize_runtime_state(pool, execution.id, false).await?;
                 Self::refresh_execution_projection_with_reason(
@@ -317,9 +317,7 @@ impl WorkflowOrchestrator {
             && steps.iter().all(|step| {
                 matches!(
                     step.status,
-                    WorkflowStepStatus::Completed
-                        | WorkflowStepStatus::Skipped
-                        | WorkflowStepStatus::Cancelled
+                    WorkflowStepStatus::Completed | WorkflowStepStatus::Skipped
                 )
             })
     }
@@ -402,7 +400,7 @@ impl WorkflowOrchestrator {
                 Self::finalize_single_step_retry_completion(pool, chat_runner, execution, step.id)
                     .await
             }
-            StepOutcome::Parked => {
+            StepOutcome::Parked | StepOutcome::Interrupted => {
                 let waiting_execution =
                     Self::synchronize_runtime_state(pool, execution.id, false).await?;
                 Self::refresh_execution_projection_with_reason(
@@ -601,6 +599,12 @@ impl WorkflowOrchestrator {
         let has_ready_step = steps
             .iter()
             .any(|step| step.status == WorkflowStepStatus::Ready);
+        let failed_steps = steps
+            .iter()
+            .filter(|step| step.status == WorkflowStepStatus::Failed)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_failed_step = !failed_steps.is_empty();
         let has_promotable_pending = steps.iter().any(|step| {
             step.status == WorkflowStepStatus::Pending
                 && !edges
@@ -617,6 +621,7 @@ impl WorkflowOrchestrator {
 
         if execution.status == WorkflowExecutionStatus::Failed
             && !has_ready_step
+            && !has_failed_step
             && !has_promotable_pending
         {
             return Err(OrchestratorError::IllegalTransition(
@@ -638,6 +643,18 @@ impl WorkflowOrchestrator {
             }
             _ => execution,
         };
+
+        for failed_step in &failed_steps {
+            Self::transition_step_and_sync(
+                pool,
+                chat_runner,
+                &resumed,
+                failed_step,
+                WorkflowStepStatus::Ready,
+                "execution_resumed_failed_step_recovered",
+            )
+            .await?;
+        }
 
         Self::refresh_execution_projection_with_reason(
             pool,

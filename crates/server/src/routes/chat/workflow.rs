@@ -528,9 +528,7 @@ pub async fn update_review_settings(
         ));
     }
     match execution.status {
-        WorkflowExecutionStatus::Completed
-        | WorkflowExecutionStatus::Failed
-        | WorkflowExecutionStatus::Cancelled => {
+        WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed => {
             return Err(ApiError::BadRequest(
                 "Review settings cannot be changed after execution has finished.".to_string(),
             ));

@@ -47,6 +47,14 @@ export function useChatData(activeSessionId: string | null): UseChatDataResult {
     refetchIntervalInBackground: true,
   });
 
+  const canLoadSessionScopedData = useMemo(
+    () =>
+      !!activeSessionId &&
+      !isSessionsLoading &&
+      sessions.some((session) => session.id === activeSessionId),
+    [activeSessionId, isSessionsLoading, sessions]
+  );
+
   const { data: agents = [], isLoading: isAgentsLoading } = useQuery({
     queryKey: ['chatAgents'],
     queryFn: () => chatApi.listAgents(),
@@ -56,7 +64,7 @@ export function useChatData(activeSessionId: string | null): UseChatDataResult {
     useQuery({
       queryKey: ['chatSessionAgents', activeSessionId],
       queryFn: () => chatApi.listSessionAgents(activeSessionId!),
-      enabled: !!activeSessionId,
+      enabled: canLoadSessionScopedData,
       staleTime: 0,
       refetchOnMount: 'always',
     });
@@ -64,13 +72,13 @@ export function useChatData(activeSessionId: string | null): UseChatDataResult {
   const { data: messagesData = [], isLoading: isMessagesLoading } = useQuery({
     queryKey: ['chatMessages', activeSessionId],
     queryFn: () => chatApi.listMessages(activeSessionId!),
-    enabled: !!activeSessionId,
+    enabled: canLoadSessionScopedData,
   });
 
   const { data: workItemsData = [], isLoading: isWorkItemsLoading } = useQuery({
     queryKey: ['chatWorkItems', activeSessionId],
     queryFn: () => chatApi.listWorkItems(activeSessionId!),
-    enabled: !!activeSessionId,
+    enabled: canLoadSessionScopedData,
   });
 
   const sortedSessions = useMemo(

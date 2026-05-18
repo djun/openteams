@@ -9,7 +9,10 @@ import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
 import type { WorkflowCardData, WorkflowCardLoopData } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import { isRetryableWorkflowStepStatus } from './workflowControlContract';
+import {
+  canRetryWorkflowStepReview,
+  isRetryableWorkflowStepStatus,
+} from './workflowControlContract';
 import {
   workflowLoopStatusMeta,
   workflowStatusLabel,
@@ -620,7 +623,6 @@ export function WorkflowGraphBoard({
       case 'interrupted':
         return 'text-rose-600';
       case 'skipped':
-      case 'cancelled':
         return 'text-slate-500';
       case 'blocked':
         return 'text-slate-600';
@@ -710,11 +712,7 @@ export function WorkflowGraphBoard({
         const status = step?.status ?? dataNode.data.status ?? 'pending';
         const retryStepId = step?.id ?? null;
         const leadReviewRequired = step?.lead_review_required ?? true;
-        const canRetryReviewStep =
-          !!step &&
-          leadReviewRequired &&
-          !!step.latest_review &&
-          isRetryableWorkflowStepStatus(step.status);
+        const canRetryReviewStep = canRetryWorkflowStepReview(step);
 
         const canRetryStep =
           !!onRetryStep &&

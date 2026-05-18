@@ -242,7 +242,7 @@ async fn apply_workflow_execution_status_migration_shim(
                                                             'interrupt_requested', 'interrupted',
                                                             'waiting_input', 'waiting_review',
                                                             'blocked', 'completed', 'failed',
-                                                            'skipped', 'cancelled'
+                                                            'skipped'
                                                         )),
                 retry_count                     INTEGER NOT NULL DEFAULT 0,
                 max_retry                       INTEGER NOT NULL DEFAULT 1,

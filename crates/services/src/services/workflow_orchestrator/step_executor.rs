@@ -1,6 +1,9 @@
 //! Step execution core: lead review feedback loop, protocol message handling.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+};
 
 use chrono::Utc;
 use db::{
@@ -49,6 +52,159 @@ pub(super) enum StepUserReviewResolution {
     Approved { feedback: String },
     Rejected { feedback: String },
     Parked,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveFrontierWorkspaceConflict {
+    workspace_path: String,
+    members: Vec<ActiveFrontierWorkspaceMember>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveFrontierWorkspaceMember {
+    session_agent_id: Uuid,
+    agent_id: Uuid,
+    agent_name: String,
+    step_key: String,
+}
+
+fn detect_active_frontier_workspace_conflicts(
+    session: &ChatSession,
+    running_step: &WorkflowStep,
+    current_steps: &[WorkflowStep],
+    edges: &[WorkflowStepEdge],
+    workflow_agent_sessions: &[WorkflowAgentSession],
+    session_agents: &[ChatSessionAgent],
+    agents: &[ChatAgent],
+) -> Vec<ActiveFrontierWorkspaceConflict> {
+    let mut step_by_id: HashMap<Uuid, WorkflowStep> = current_steps
+        .iter()
+        .cloned()
+        .map(|step| (step.id, step))
+        .collect();
+    step_by_id.insert(running_step.id, running_step.clone());
+
+    let predecessors_by_step = edges.iter().fold(
+        HashMap::<Uuid, Vec<Uuid>>::new(),
+        |mut predecessors, edge| {
+            predecessors
+                .entry(edge.to_step_id)
+                .or_default()
+                .push(edge.from_step_id);
+            predecessors
+        },
+    );
+    let workflow_session_by_id: HashMap<Uuid, &WorkflowAgentSession> = workflow_agent_sessions
+        .iter()
+        .map(|workflow_session| (workflow_session.id, workflow_session))
+        .collect();
+    let session_agent_by_id: HashMap<Uuid, &ChatSessionAgent> = session_agents
+        .iter()
+        .map(|session_agent| (session_agent.id, session_agent))
+        .collect();
+    let agent_by_id: HashMap<Uuid, &ChatAgent> =
+        agents.iter().map(|agent| (agent.id, agent)).collect();
+    let mut members_by_workspace: BTreeMap<String, BTreeMap<Uuid, ActiveFrontierWorkspaceMember>> =
+        BTreeMap::new();
+
+    for step in step_by_id.values() {
+        if step.step_type != WorkflowStepType::Task || !is_active_frontier_step(step) {
+            continue;
+        }
+        let predecessors_completed = predecessors_by_step
+            .get(&step.id)
+            .map(|predecessors| {
+                predecessors.iter().all(|predecessor_id| {
+                    step_by_id
+                        .get(predecessor_id)
+                        .is_some_and(|predecessor| is_completed_like_step(predecessor))
+                })
+            })
+            .unwrap_or(true);
+        if !predecessors_completed {
+            continue;
+        }
+
+        let Some(workflow_session_id) = step.assigned_workflow_agent_session_id else {
+            continue;
+        };
+        let Some(workflow_session) = workflow_session_by_id.get(&workflow_session_id) else {
+            continue;
+        };
+        let Some(session_agent) = session_agent_by_id.get(&workflow_session.session_agent_id)
+        else {
+            continue;
+        };
+        let Some(agent) = agent_by_id.get(&session_agent.agent_id) else {
+            continue;
+        };
+        let workspace_path = normalize_workspace_path(&workflow_runtime::resolve_workspace_path(
+            session,
+            agent,
+            session_agent,
+        ));
+        if workspace_path.is_empty() {
+            continue;
+        }
+
+        members_by_workspace
+            .entry(workspace_path)
+            .or_default()
+            .entry(session_agent.id)
+            .or_insert_with(|| ActiveFrontierWorkspaceMember {
+                session_agent_id: session_agent.id,
+                agent_id: agent.id,
+                agent_name: agent.name.clone(),
+                step_key: step.step_key.clone(),
+            });
+    }
+
+    members_by_workspace
+        .into_iter()
+        .filter_map(|(workspace_path, members)| {
+            if members.len() <= 1 {
+                return None;
+            }
+            Some(ActiveFrontierWorkspaceConflict {
+                workspace_path,
+                members: members.into_values().collect(),
+            })
+        })
+        .collect()
+}
+
+fn is_active_frontier_step(step: &WorkflowStep) -> bool {
+    matches!(
+        step.status,
+        WorkflowStepStatus::Ready | WorkflowStepStatus::Running | WorkflowStepStatus::Revising
+    )
+}
+
+fn is_completed_like_step(step: &WorkflowStep) -> bool {
+    matches!(
+        step.status,
+        WorkflowStepStatus::Completed | WorkflowStepStatus::Skipped
+    )
+}
+
+fn normalize_workspace_path(path: &Path) -> String {
+    let mut normalized = path.to_string_lossy().trim().replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    #[cfg(windows)]
+    {
+        normalized = normalized.to_ascii_lowercase();
+    }
+    normalized
+}
+
+fn inject_step_prompt_section_before_schema(prompt: &mut String, section: &str) {
+    if let Some(index) = prompt.find("\n\nRequired JSON Schema:") {
+        prompt.insert_str(index, section);
+    } else {
+        prompt.push_str(section);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1439,6 +1595,61 @@ Read this file before writing the final result. Do not rely on the workflow plan
         }
     }
 
+    fn active_frontier_workspace_isolation_prompt(
+        session: &ChatSession,
+        running_step: &WorkflowStep,
+        current_steps: &[WorkflowStep],
+        edges: &[WorkflowStepEdge],
+        workflow_agent_sessions: &[WorkflowAgentSession],
+        current_session_agent: &ChatSessionAgent,
+        session_agents: &[ChatSessionAgent],
+        agents: &[ChatAgent],
+    ) -> Option<String> {
+        let conflicts = detect_active_frontier_workspace_conflicts(
+            session,
+            running_step,
+            current_steps,
+            edges,
+            workflow_agent_sessions,
+            session_agents,
+            agents,
+        );
+        let conflict = conflicts.iter().find(|conflict| {
+            conflict
+                .members
+                .iter()
+                .any(|member| member.session_agent_id == current_session_agent.id)
+        })?;
+
+        let members = conflict
+            .members
+            .iter()
+            .map(|member| {
+                format!(
+                    "- {} ({}) running step `{}`",
+                    member.agent_name, member.agent_id, member.step_key
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Some(format!(
+            r#"
+
+## Workspace Isolation Requirement
+
+The active workflow frontier has multiple members running in parallel in the same workspace:
+
+- Shared workspace: `{workspace_path}`
+{members}
+
+Before modifying files, you MUST use the `using-git-workspace` skill to create an isolated git workspace for this step. Do all edits and verification inside that isolated environment. Before returning the final_result, merge/sync the completed changes back into the original workflow workspace and report the merge result in your JSON output.
+"#,
+            workspace_path = conflict.workspace_path,
+            members = members
+        ))
+    }
+
     /// Execute a single step: resolve context, transition to Running, run agent
     /// prompt, process the result.
     pub(crate) async fn prepare_and_run_step(
@@ -1549,7 +1760,17 @@ Read this file before writing the final result. Do not rely on the workflow plan
             .iter()
             .map(|s| s.name.clone())
             .collect();
-        let prompt = if let Some(pending_feedback) = pending_revision_feedback.as_ref() {
+        let workspace_isolation_prompt = Self::active_frontier_workspace_isolation_prompt(
+            session,
+            &running_step,
+            current_steps,
+            edges,
+            workflow_agent_sessions,
+            session_agent,
+            session_agents,
+            agents,
+        );
+        let mut prompt = if let Some(pending_feedback) = pending_revision_feedback.as_ref() {
             build_step_revision_prompt_with_schema(
                 &running_step,
                 pending_feedback.source,
@@ -1569,6 +1790,9 @@ Read this file before writing the final result. Do not rely on the workflow plan
                 &agent_skill_names,
             )
         };
+        if let Some(section) = workspace_isolation_prompt.as_deref() {
+            inject_step_prompt_section_before_schema(&mut prompt, section);
+        }
 
         tracing::debug!(
             "Running step {} with prompt:\n{}",
@@ -1628,7 +1852,7 @@ Read this file before writing the final result. Do not rely on the workflow plan
                     None,
                 )
                 .await;
-                return Ok(StepOutcome::Failed(reason));
+                return Ok(StepOutcome::Interrupted);
             }
             Err(err) => {
                 let err_message = err.to_string();

@@ -381,9 +381,7 @@ impl WorkflowOrchestrator {
             .filter(|execution| {
                 matches!(
                     execution.status,
-                    WorkflowExecutionStatus::Completed
-                        | WorkflowExecutionStatus::Failed
-                        | WorkflowExecutionStatus::Cancelled
+                    WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
                 )
             })
             .filter_map(|execution| execution.workflow_card_message_id)
@@ -440,6 +438,7 @@ impl WorkflowOrchestrator {
         // Idempotent check: if active execution exists for this plan, return early
         let active_executions =
             WorkflowExecution::find_non_terminal_by_session(pool, plan.session_id).await?;
+        let mut recovered_incomplete_execution_ids = HashSet::new();
         for existing in &active_executions {
             tracing::debug!(
                 "checking existing execution {} with plan_id {:?} new plan_id {}",
@@ -449,6 +448,31 @@ impl WorkflowOrchestrator {
             );
 
             if existing.plan_id == plan_id {
+                let steps = WorkflowStep::find_by_execution(pool, existing.id).await?;
+                if existing.active_round_id.is_none() || steps.is_empty() {
+                    tracing::warn!(
+                        execution_id = %existing.id,
+                        plan_id = %plan_id,
+                        active_round_id = ?existing.active_round_id,
+                        step_count = steps.len(),
+                        "found incomplete workflow execution during idempotent execute_plan; marking failed and bootstrapping a new execution"
+                    );
+                    let _ = Self::transition_execution_and_sync(
+                        pool,
+                        chat_runner,
+                        existing,
+                        WorkflowExecutionStatus::Failed,
+                        "execution_bootstrap_recovered",
+                        Some(
+                            "Previous execution bootstrap did not materialize workflow steps; retrying plan execution."
+                                .to_string(),
+                        ),
+                    )
+                    .await?;
+                    recovered_incomplete_execution_ids.insert(existing.id);
+                    continue;
+                }
+
                 tracing::info!(
                     "found existing active execution {} for plan {}, returning existing execution",
                     existing.id,
@@ -487,7 +511,6 @@ impl WorkflowOrchestrator {
                     }
                 }
 
-                let steps = WorkflowStep::find_by_execution(pool, existing.id).await?;
                 let edges = WorkflowStepEdge::find_by_execution(pool, existing.id).await?;
                 let agent_sessions =
                     WorkflowAgentSession::find_by_execution(pool, existing.id).await?;
@@ -505,7 +528,10 @@ impl WorkflowOrchestrator {
                 });
             }
         }
-        if !active_executions.is_empty() {
+        if active_executions
+            .iter()
+            .any(|execution| !recovered_incomplete_execution_ids.contains(&execution.id))
+        {
             return Err(OrchestratorError::IllegalTransition(
                 "another workflow execution is already active in this session".to_string(),
             ));
@@ -606,7 +632,9 @@ impl WorkflowOrchestrator {
                     | WorkflowStepStatus::WaitingReview
                     | WorkflowStepStatus::WaitingInput
             ) {
-                cancel_running_step(step.id);
+                if step.status == WorkflowStepStatus::Running {
+                    cancel_running_step(step.id);
+                }
                 let interrupt_requested = Self::transition_step_and_sync(
                     pool,
                     chat_runner,
@@ -713,24 +741,6 @@ impl WorkflowOrchestrator {
             step_id,
             "user",
         );
-
-        let synced_execution = Self::synchronize_runtime_state(pool, execution_id, false).await?;
-        if !matches!(
-            synced_execution.status,
-            WorkflowExecutionStatus::Completed
-                | WorkflowExecutionStatus::Failed
-                | WorkflowExecutionStatus::Cancelled
-        ) {
-            let _ = Self::transition_execution_and_sync(
-                pool,
-                chat_runner,
-                &synced_execution,
-                WorkflowExecutionStatus::Cancelled,
-                "execution_cancelled",
-                None,
-            )
-            .await?;
-        }
 
         Ok(interrupted_step)
     }

@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use db::{
     DBService,
     models::{
@@ -38,7 +38,8 @@ use executors::{
     approvals::NoopExecutorApprovalService,
     env::{ExecutionEnv, RepoContext},
     executors::{
-        BaseCodingAgent, ExecutorError, ExecutorExitResult, SpawnedChild,
+        BaseCodingAgent, CancellationToken, ExecutorError, ExecutorExitResult, ExecutorExitSignal,
+        SpawnedChild,
         StandardCodingAgentExecutor,
     },
     logs::{
@@ -76,15 +77,28 @@ pub const WORKFLOW_PROTOCOL_PARSE_MAX_RETRIES: u32 = 1;
 
 /// Global registry: step_id → (CancellationToken, child_pid).
 /// Used to cancel a running agent process when a step is interrupted.
-static RUNNING_STEPS: Lazy<DashMap<Uuid, executors::executors::CancellationToken>> =
-    Lazy::new(DashMap::new);
+static RUNNING_STEPS: Lazy<DashMap<Uuid, CancellationToken>> = Lazy::new(DashMap::new);
+static STEP_CANCEL_REQUESTS: Lazy<DashSet<Uuid>> = Lazy::new(DashSet::new);
 
 /// Cancel the running agent process for the given step, if any.
 /// Called from the orchestrator's `interrupt_step` to truly stop execution.
 pub fn cancel_running_step(step_id: Uuid) {
+    STEP_CANCEL_REQUESTS.insert(step_id);
     if let Some((_, token)) = RUNNING_STEPS.remove(&step_id) {
         token.cancel();
     }
+}
+
+fn register_running_step(step_id: Uuid, token: CancellationToken) {
+    if STEP_CANCEL_REQUESTS.contains(&step_id) {
+        token.cancel();
+    }
+    RUNNING_STEPS.insert(step_id, token);
+}
+
+fn clear_running_step(step_id: Uuid) {
+    RUNNING_STEPS.remove(&step_id);
+    STEP_CANCEL_REQUESTS.remove(&step_id);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1264,6 +1278,8 @@ If it is a coding task, follow Test-Driven Development for every implementation 
 2. **Green** — Write the minimum implementation to make all tests pass. No extra features.
 3. **Refactor** — Clean up code while keeping tests green. Improve naming, remove duplication, simplify logic.
 4. If no test framework exists in the project, create minimal verification scripts that assert expected behavior before implementing.
+
+For non-coding tasks, it's not necessary to strictly follow the TDD pattern.
 "#;
 
 static STEP_EXECUTION_TDD_WORKFLOW_FOR_REVIEW_TYPE: &str = r#"
@@ -1930,9 +1946,7 @@ pub fn build_workflow_card_projection(
     let state = match execution.status {
         WorkflowExecutionStatus::Pending => WorkflowCardState::Pending,
         WorkflowExecutionStatus::Completed => WorkflowCardState::Completed,
-        WorkflowExecutionStatus::Failed | WorkflowExecutionStatus::Cancelled => {
-            WorkflowCardState::Failed
-        }
+        WorkflowExecutionStatus::Failed => WorkflowCardState::Failed,
         WorkflowExecutionStatus::Paused => WorkflowCardState::Paused,
         WorkflowExecutionStatus::Waiting => WorkflowCardState::Waiting,
         WorkflowExecutionStatus::Recompiling => WorkflowCardState::Running,
@@ -1941,9 +1955,7 @@ pub fn build_workflow_card_projection(
 
     let is_terminal = matches!(
         execution.status,
-        WorkflowExecutionStatus::Completed
-            | WorkflowExecutionStatus::Failed
-            | WorkflowExecutionStatus::Cancelled
+        WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
     );
 
     Ok(WorkflowCardProjection {
@@ -2099,9 +2111,7 @@ pub fn build_workflow_card_projection_lightweight(
     let state = match execution.status {
         WorkflowExecutionStatus::Pending => WorkflowCardState::Pending,
         WorkflowExecutionStatus::Completed => WorkflowCardState::Completed,
-        WorkflowExecutionStatus::Failed | WorkflowExecutionStatus::Cancelled => {
-            WorkflowCardState::Failed
-        }
+        WorkflowExecutionStatus::Failed => WorkflowCardState::Failed,
         WorkflowExecutionStatus::Paused => WorkflowCardState::Paused,
         WorkflowExecutionStatus::Waiting => WorkflowCardState::Waiting,
         WorkflowExecutionStatus::Recompiling => WorkflowCardState::Running,
@@ -2110,9 +2120,7 @@ pub fn build_workflow_card_projection_lightweight(
 
     let is_terminal = matches!(
         execution.status,
-        WorkflowExecutionStatus::Completed
-            | WorkflowExecutionStatus::Failed
-            | WorkflowExecutionStatus::Cancelled
+        WorkflowExecutionStatus::Completed | WorkflowExecutionStatus::Failed
     );
 
     let has_transcripts = transcript_count.map(|count| count > 0);
@@ -2553,9 +2561,7 @@ fn derive_round_graph_status(steps: &[WorkflowStep]) -> String {
         && steps.iter().all(|step| {
             matches!(
                 step.status,
-                WorkflowStepStatus::Completed
-                    | WorkflowStepStatus::Skipped
-                    | WorkflowStepStatus::Cancelled
+                WorkflowStepStatus::Completed | WorkflowStepStatus::Skipped
             )
         })
     {
@@ -3007,7 +3013,7 @@ async fn run_workflow_agent_prompt_inner(
 
     // Register the cancel token so interrupt_step can terminate this process.
     if let Some(cancel) = spawned.cancel.clone() {
-        RUNNING_STEPS.insert(step_id, cancel);
+        register_running_step(step_id, cancel);
     }
 
     let msg_store = Arc::new(MsgStore::new());
@@ -3039,23 +3045,32 @@ async fn run_workflow_agent_prompt_inner(
     let mut status = None;
 
     if let Some(exit_signal) = spawned.exit_signal.take() {
-        match time::timeout(WORKFLOW_EXECUTION_TIMEOUT, exit_signal).await {
-            Ok(Ok(ExecutorExitResult::Success)) => {}
-            Ok(Ok(ExecutorExitResult::Failure)) => {
+        match wait_for_executor_exit_or_cancel(exit_signal, spawned.cancel.clone()).await {
+            Ok(ExecutorWaitEvent::Exit(Ok(ExecutorExitResult::Success))) => {}
+            Ok(ExecutorWaitEvent::Exit(Ok(ExecutorExitResult::Failure))) => {
                 // Check if this failure was caused by an interrupt cancellation.
-                if !RUNNING_STEPS.contains_key(&step_id) {
+                if STEP_CANCEL_REQUESTS.contains(&step_id)
+                    || spawned.cancel.as_ref().is_some_and(|c| c.is_cancelled())
+                    || !RUNNING_STEPS.contains_key(&step_id)
+                {
                     interrupted = true;
                 } else {
                     failed_by_signal = true;
                 }
             }
-            Ok(Ok(ExecutorExitResult::FailureWithError(_))) => failed_by_signal = true,
-            Ok(Err(_)) => {
+            Ok(ExecutorWaitEvent::Exit(Ok(ExecutorExitResult::FailureWithError(_)))) => {
+                failed_by_signal = true
+            }
+            Ok(ExecutorWaitEvent::Exit(Err(_))) => {
                 status = Some(wait_for_process_exit(&mut spawned, &agent.name).await?);
+            }
+            Ok(ExecutorWaitEvent::CancelRequested) => {
+                interrupted = true;
+                terminate_child(&mut spawned).await;
             }
             Err(_) => {
                 terminate_child(&mut spawned).await;
-                RUNNING_STEPS.remove(&step_id);
+                clear_running_step(step_id);
                 finish_workflow_runtime_stream(&msg_store, &mut workflow_stream_task).await;
                 finish_workflow_runtime_session_id_persistor(&mut session_id_task).await;
                 let history = msg_store.get_history();
@@ -3069,7 +3084,7 @@ async fn run_workflow_agent_prompt_inner(
             match time::timeout(WORKFLOW_REAP_TIMEOUT, spawned.child.wait()).await {
                 Ok(Ok(exit_status)) => status = Some(exit_status),
                 Ok(Err(err)) => {
-                    RUNNING_STEPS.remove(&step_id);
+                    clear_running_step(step_id);
                     finish_workflow_runtime_stream(&msg_store, &mut workflow_stream_task).await;
                     finish_workflow_runtime_session_id_persistor(&mut session_id_task).await;
                     return Err(WorkflowRuntimeError::Io(err));
@@ -3082,7 +3097,7 @@ async fn run_workflow_agent_prompt_inner(
     }
 
     // Unregister from the running steps map.
-    RUNNING_STEPS.remove(&step_id);
+    clear_running_step(step_id);
     finish_workflow_runtime_stream(&msg_store, &mut workflow_stream_task).await;
     finish_workflow_runtime_session_id_persistor(&mut session_id_task).await;
 
@@ -4208,6 +4223,28 @@ fn spawn_log_forwarders(
     Ok(())
 }
 
+enum ExecutorWaitEvent {
+    Exit(Result<ExecutorExitResult, tokio::sync::oneshot::error::RecvError>),
+    CancelRequested,
+}
+
+async fn wait_for_executor_exit_or_cancel(
+    exit_signal: ExecutorExitSignal,
+    cancel: Option<CancellationToken>,
+) -> Result<ExecutorWaitEvent, tokio::time::error::Elapsed> {
+    time::timeout(WORKFLOW_EXECUTION_TIMEOUT, async move {
+        if let Some(cancel) = cancel {
+            tokio::select! {
+                result = exit_signal => ExecutorWaitEvent::Exit(result),
+                _ = cancel.cancelled() => ExecutorWaitEvent::CancelRequested,
+            }
+        } else {
+            ExecutorWaitEvent::Exit(exit_signal.await)
+        }
+    })
+    .await
+}
+
 async fn wait_for_process_exit(
     spawned: &mut SpawnedChild,
     agent_name: &str,
@@ -5135,6 +5172,24 @@ mod tests {
     }
 
     #[test]
+    fn cancel_running_step_cancels_late_registered_executor_token() {
+        let step_id = Uuid::new_v4();
+        clear_running_step(step_id);
+
+        cancel_running_step(step_id);
+
+        let token = executors::executors::CancellationToken::new();
+        register_running_step(step_id, token.clone());
+        assert!(token.is_cancelled());
+
+        clear_running_step(step_id);
+        let next_token = executors::executors::CancellationToken::new();
+        register_running_step(step_id, next_token.clone());
+        assert!(!next_token.is_cancelled());
+        clear_running_step(step_id);
+    }
+
+    #[test]
     fn workflow_runtime_line_maps_reasoning_to_thinking() {
         let entry = NormalizedEntry {
             timestamp: None,
@@ -5223,7 +5278,6 @@ mod tests {
             WorkflowStepStatus::Completed,
             WorkflowStepStatus::Failed,
             WorkflowStepStatus::Skipped,
-            WorkflowStepStatus::Cancelled,
         ]
         .into_iter()
         .map(|status| {
@@ -5418,11 +5472,10 @@ mod tests {
     }
 
     #[test]
-    fn is_terminal_true_for_completed_failed_and_cancelled() {
+    fn is_terminal_true_for_completed_and_failed() {
         for (status, expected_terminal) in [
             (WorkflowExecutionStatus::Completed, true),
             (WorkflowExecutionStatus::Failed, true),
-            (WorkflowExecutionStatus::Cancelled, true),
             (WorkflowExecutionStatus::Running, false),
             (WorkflowExecutionStatus::Pending, false),
             (WorkflowExecutionStatus::Paused, false),
@@ -5458,58 +5511,5 @@ mod tests {
                 execution.status
             );
         }
-    }
-
-    #[test]
-    fn cancelled_execution_maps_to_failed_card_state_in_projections() {
-        let execution = sample_execution(WorkflowExecutionStatus::Cancelled);
-        let plan_json = sample_plan_json();
-        let plan = sample_plan(execution.plan_id);
-        let revision = sample_revision(plan.id, plan_json);
-        let (session_agents, agents) = sample_agent_views();
-        let step = sample_step(WorkflowStepStatus::Cancelled);
-
-        let full = build_workflow_card_projection(
-            &execution,
-            &plan,
-            &revision,
-            std::slice::from_ref(&revision),
-            std::slice::from_ref(&step),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &session_agents,
-            &agents,
-            None,
-        )
-        .expect("build full projection");
-        assert!(matches!(full.state, WorkflowCardState::Failed));
-        assert!(full.is_terminal);
-
-        let lightweight = build_workflow_card_projection_lightweight(
-            &execution,
-            &plan,
-            &revision,
-            std::slice::from_ref(&revision),
-            &[step],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &session_agents,
-            &agents,
-            None,
-            None,
-        )
-        .expect("build lightweight projection");
-        assert!(matches!(lightweight.state, WorkflowCardState::Failed));
-        assert!(lightweight.is_terminal);
     }
 }

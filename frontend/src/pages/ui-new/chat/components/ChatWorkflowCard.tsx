@@ -39,11 +39,7 @@ type WorkflowPlanGenerationMeta = {
   error_message?: string | null;
 };
 
-const REVIEW_READY_STEP_STATUSES = new Set([
-  'completed',
-  'skipped',
-  'cancelled',
-]);
+const REVIEW_READY_STEP_STATUSES = new Set(['completed', 'skipped']);
 
 function getStepProgress(steps: WorkflowCardStep[]) {
   return {

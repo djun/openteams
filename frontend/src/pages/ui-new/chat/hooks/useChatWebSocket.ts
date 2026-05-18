@@ -117,6 +117,16 @@ const SUPPRESSED_PROTOCOL_NOTICE_CODES = new Set([
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 
+const isWorkflowCardMessage = (message: ChatMessage): boolean => {
+  if (!isRecord(message.meta)) return false;
+  const cardType = message.meta.card_type;
+  return (
+    cardType === 'workflow_execution' ||
+    cardType === 'workflow_plan' ||
+    cardType === 'workflow_plan_generation'
+  );
+};
+
 const extractCompressionWarningFromMeta = (
   meta: unknown
 ): CompressionWarning | null => {
@@ -765,6 +775,15 @@ export function useChatWebSocket(
 
           if (payload.type === 'message_updated') {
             handleMessageNew(payload.message);
+            if (isWorkflowCardMessage(payload.message)) {
+              void handleWorkflowProjectionRefresh(payload.message.session_id);
+            }
+            return;
+          }
+
+          if (payload.type === 'workflow_plan_preview_ready') {
+            handleMessageNew(payload.workflow_card_message);
+            void handleWorkflowProjectionRefresh(payload.session_id);
             return;
           }
 

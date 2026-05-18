@@ -1,40 +1,53 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use db::models::workflow_types::*;
 use sha2::{Digest, Sha256};
 
 use super::workflow_validator::{self, ValidationResult};
 
-/// 编译错误
+/// Compile errors produced by workflow plan compilation.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
-    #[error("计划校验失败: {0}")]
+    #[error("Plan validation failed: {0}")]
     ValidationFailed(String),
-    #[error("编译错误: {0}")]
+    #[error("Compilation failed: {0}")]
     CompileError(String),
 }
 
-/// 编译器：将 workflow plan JSON 转换为可执行的 compiled graph
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWorkspaceConflict {
+    pub wave_index: usize,
+    pub workspace_path: String,
+    pub members: Vec<ParallelWorkspaceMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWorkspaceMember {
+    pub agent_id: String,
+    pub step_keys: Vec<String>,
+}
+
+/// Compiler that converts workflow plan JSON into an executable compiled graph.
 pub struct WorkflowCompiler;
 
 impl WorkflowCompiler {
-    /// 从 JSON 字符串解析并编译 workflow plan
+    /// Parse and compile a workflow plan from a JSON string.
     pub fn compile_from_json(
         json_str: &str,
         valid_agent_ids: &[String],
     ) -> Result<CompiledGraph, CompileError> {
         let plan: WorkflowPlanJson = serde_json::from_str(json_str)
-            .map_err(|e| CompileError::ValidationFailed(format!("JSON 解析失败: {}", e)))?;
+            .map_err(|e| CompileError::ValidationFailed(format!("Failed to parse JSON: {}", e)))?;
 
         Self::compile(&plan, valid_agent_ids)
     }
 
-    /// 编译 workflow plan 为 compiled graph
+    /// Compile a workflow plan into a compiled graph.
     pub fn compile(
         plan: &WorkflowPlanJson,
         valid_agent_ids: &[String],
     ) -> Result<CompiledGraph, CompileError> {
-        // 1. 执行综合校验
+        // 1. Run full validation.
         let validation = workflow_validator::validate_plan(plan, valid_agent_ids);
         if !validation.is_valid {
             let error_messages: Vec<String> = validation
@@ -44,7 +57,7 @@ impl WorkflowCompiler {
                 .collect();
             return Err(CompileError::ValidationFailed(error_messages.join("; ")));
         }
-        // 2. 编译节点为 CompiledStep
+        // 2. Compile nodes into CompiledStep.
         let default_retry = plan.globals.as_ref().map(|g| g.default_retry).unwrap_or(1);
 
         let mut steps: Vec<CompiledStep> = Vec::with_capacity(plan.nodes.len());
@@ -58,7 +71,7 @@ impl WorkflowCompiler {
                 "result" => WorkflowStepType::Result,
                 other => {
                     return Err(CompileError::CompileError(format!(
-                        "未知步骤类型: {}",
+                        "Unknown step type: {}",
                         other
                     )));
                 }
@@ -97,7 +110,7 @@ impl WorkflowCompiler {
             Some(discovered)
         };
 
-        // 3. 编译边为 CompiledEdge
+        // 3. Compile edges into CompiledEdge.
         let edges: Vec<CompiledEdge> = plan
             .edges
             .iter()
@@ -120,7 +133,7 @@ impl WorkflowCompiler {
             })
             .collect();
 
-        // 4. 计算初始 ready steps（无入边的节点）
+        // 4. Compute initial ready steps: nodes without incoming edges.
         let targets: HashSet<&str> = plan.edges.iter().map(|e| e.target.as_str()).collect();
         let ready_step_keys: Vec<String> = plan
             .nodes
@@ -129,7 +142,7 @@ impl WorkflowCompiler {
             .map(|n| n.id.clone())
             .collect();
 
-        // 5. 计算确定性 hash
+        // 5. Compute deterministic hashes.
         let plan_hash = Self::compute_hash(plan);
         let compiled_graph_hash = Self::compute_compiled_hash(&steps, &edges, loops.as_deref());
 
@@ -143,21 +156,131 @@ impl WorkflowCompiler {
         })
     }
 
-    /// 仅执行校验，不编译
+    /// Validate only, without compiling.
     pub fn validate_only(plan: &WorkflowPlanJson, valid_agent_ids: &[String]) -> ValidationResult {
         workflow_validator::validate_plan(plan, valid_agent_ids)
     }
 
-    /// 计算 plan JSON 的确定性 hash
+    /// Finds pre-run task waves where multiple agents can run in parallel while
+    /// sharing the same effective workspace.
+    ///
+    /// The `agent_workspace_by_id` map is keyed by workflow `agentId`. Callers
+    /// should pass already-resolved effective workspaces, including any session
+    /// default fallback.
+    pub fn find_parallel_workspace_conflicts(
+        graph: &CompiledGraph,
+        agent_workspace_by_id: &HashMap<String, String>,
+    ) -> Vec<ParallelWorkspaceConflict> {
+        let step_by_key: HashMap<&str, &CompiledStep> = graph
+            .steps
+            .iter()
+            .map(|step| (step.step_key.as_str(), step))
+            .collect();
+        let mut in_degree: BTreeMap<&str, usize> = graph
+            .steps
+            .iter()
+            .map(|step| (step.step_key.as_str(), 0))
+            .collect();
+        let mut adjacency: BTreeMap<&str, Vec<&str>> = graph
+            .steps
+            .iter()
+            .map(|step| (step.step_key.as_str(), Vec::new()))
+            .collect();
+
+        for edge in &graph.edges {
+            let from = edge.from_step_key.as_str();
+            let to = edge.to_step_key.as_str();
+            if !step_by_key.contains_key(from) || !step_by_key.contains_key(to) {
+                continue;
+            }
+            adjacency.entry(from).or_default().push(to);
+            *in_degree.entry(to).or_default() += 1;
+        }
+
+        let mut ready: BTreeSet<&str> = in_degree
+            .iter()
+            .filter_map(|(step_key, degree)| (*degree == 0).then_some(*step_key))
+            .collect();
+        let mut conflicts = Vec::new();
+        let mut wave_index = 0;
+
+        while !ready.is_empty() {
+            let wave = ready.iter().copied().collect::<Vec<_>>();
+            let mut workspace_members: BTreeMap<String, BTreeMap<String, Vec<String>>> =
+                BTreeMap::new();
+
+            for step_key in &wave {
+                let Some(step) = step_by_key.get(step_key) else {
+                    continue;
+                };
+                if step.step_type != WorkflowStepType::Task {
+                    continue;
+                }
+                let Some(agent_id) = step.assigned_agent_id.as_ref() else {
+                    continue;
+                };
+                let Some(workspace_path) = agent_workspace_by_id
+                    .get(agent_id)
+                    .and_then(|path| normalize_workspace_key(path))
+                else {
+                    continue;
+                };
+                workspace_members
+                    .entry(workspace_path)
+                    .or_default()
+                    .entry(agent_id.clone())
+                    .or_default()
+                    .push(step.step_key.clone());
+            }
+
+            for (workspace_path, members_by_agent) in workspace_members {
+                if members_by_agent.len() <= 1 {
+                    continue;
+                }
+                conflicts.push(ParallelWorkspaceConflict {
+                    wave_index,
+                    workspace_path,
+                    members: members_by_agent
+                        .into_iter()
+                        .map(|(agent_id, step_keys)| ParallelWorkspaceMember {
+                            agent_id,
+                            step_keys,
+                        })
+                        .collect(),
+                });
+            }
+
+            let mut next_ready = BTreeSet::new();
+            for step_key in wave {
+                if let Some(neighbors) = adjacency.get(step_key) {
+                    for neighbor in neighbors {
+                        if let Some(degree) = in_degree.get_mut(neighbor) {
+                            *degree = degree.saturating_sub(1);
+                            if *degree == 0 {
+                                next_ready.insert(*neighbor);
+                            }
+                        }
+                    }
+                }
+            }
+
+            ready = next_ready;
+            wave_index += 1;
+        }
+
+        conflicts
+    }
+
+    /// Compute the deterministic hash for plan JSON.
     pub fn compute_hash(plan: &WorkflowPlanJson) -> String {
-        // 使用 canonical JSON 序列化保证确定性
+        // Use canonical JSON serialization to preserve determinism.
         let canonical = serde_json::to_string(plan).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
         format!("{:x}", hasher.finalize())
     }
 
-    /// 计算编译产物的确定性 hash（覆盖所有影响调度和行为的字段）
+    /// Compute the deterministic hash for compiled output, covering all fields that affect scheduling and behavior.
     fn compute_compiled_hash(
         steps: &[CompiledStep],
         edges: &[CompiledEdge],
@@ -253,14 +376,14 @@ impl WorkflowCompiler {
             for member_key in &member_step_keys {
                 if let Some(existing_loop) = claimed_nodes.get(member_key) {
                     return Err(CompileError::CompileError(format!(
-                        "reviewScope 非法: task 节点 '{}' 同时被 loop '{}' 和 '{}' 声明；当前运行模型要求一个 task 只能属于一个 review loop。请从其中一个 reviewScope 中移除该节点，或拆分为两个独立 task。",
+                        "Invalid reviewScope: task node '{}' is declared by both loop '{}' and loop '{}'. The runtime model requires each task to belong to at most one review loop. Remove this node from one reviewScope or split it into two separate task nodes.",
                         member_key, existing_loop, loop_key
                     )));
                 }
             }
             if let Some(existing_loop) = claimed_nodes.get(&node.id) {
                 return Err(CompileError::CompileError(format!(
-                    "reviewScope 非法: review 节点 '{}' 同时被 loop '{}' 和 '{}' 声明；一个 review 节点只能作为一个 loop 的审核节点。",
+                    "Invalid reviewScope: review node '{}' is declared by both loop '{}' and loop '{}'. A review node can only be the review node for one loop.",
                     node.id, existing_loop, loop_key
                 )));
             }
@@ -308,7 +431,7 @@ impl WorkflowCompiler {
         for scope_key in review_scope {
             if !member_seen.insert(scope_key.as_str()) {
                 errors.push(format!(
-                    "reviewScope 非法: review 节点 '{}' 的 reviewScope 重复声明了节点 '{}'。请删除重复项。",
+                    "Invalid reviewScope: review node '{}' declares node '{}' more than once. Remove the duplicate entry.",
                     review_step_key, scope_key
                 ));
                 continue;
@@ -316,14 +439,14 @@ impl WorkflowCompiler {
 
             let Some(scope_node) = node_by_id.get(scope_key.as_str()) else {
                 errors.push(format!(
-                    "reviewScope 非法: review 节点 '{}' 引用了不存在的节点 '{}'。请改为已有 task 节点 id。",
+                    "Invalid reviewScope: review node '{}' references missing node '{}'. Use an existing task node id.",
                     review_step_key, scope_key
                 ));
                 continue;
             };
             if scope_node.data.step_type != "task" {
                 errors.push(format!(
-                    "reviewScope 非法: review 节点 '{}' 的 reviewScope 节点 '{}' 类型是 '{}'，但 reviewScope 只能包含 task 节点。",
+                    "Invalid reviewScope: review node '{}' includes node '{}' with type '{}', but reviewScope can only include task nodes.",
                     review_step_key, scope_key, scope_node.data.step_type
                 ));
                 continue;
@@ -344,7 +467,7 @@ impl WorkflowCompiler {
             };
             if path_tasks.is_empty() {
                 errors.push(format!(
-                    "reviewScope 非法: review 节点 '{}' 的 reviewScope 节点 '{}' 不是该 review 的前置节点；图中不存在从 '{}' 到 '{}' 的有向路径。",
+                    "Invalid reviewScope: node '{}' in review node '{}' is not a predecessor of that review node. The graph has no directed path from '{}' to '{}'.",
                     review_step_key, scope_key, scope_key, review_step_key
                 ));
                 continue;
@@ -359,7 +482,7 @@ impl WorkflowCompiler {
             for path_task in path_tasks {
                 if !member_set.contains(path_task.as_str()) {
                     errors.push(format!(
-                        "reviewScope 非法: review 节点 '{}' 的 reviewScope 包含 '{}'，但从 '{}' 到 '{}' 的路径上还经过 task 节点 '{}'。为了保证 retry 时状态一致，请把 '{}' 也加入该 reviewScope，或调整依赖边。",
+                        "Invalid reviewScope: review node '{}' includes '{}', but the path from '{}' to '{}' also passes through task node '{}'. To keep retry state consistent, also add '{}' to this reviewScope or adjust the dependency edges.",
                         review_step_key,
                         scope_key,
                         scope_key,
@@ -411,7 +534,7 @@ impl WorkflowCompiler {
                 }
                 "review" => {
                     return Err(CompileError::CompileError(format!(
-                        "reviewScope 非法: 节点 '{}' 到 review 节点 '{}' 的路径经过了另一个 review 节点 '{}'。当前不支持跨 review 边界声明 loop，请只声明当前 review 直接负责重试的 task。",
+                        "Invalid reviewScope: the path from node '{}' to review node '{}' passes through another review node '{}'. Loops cannot cross review boundaries; declare only the task nodes directly retried by this review node.",
                         start_step_key, review_step_key, step_key
                     )));
                 }
@@ -460,7 +583,7 @@ impl WorkflowCompiler {
         false
     }
 
-    /// 拓扑排序（Kahn's algorithm），返回节点 id 的排序列表
+    /// Topological sort using Kahn's algorithm. Returns ordered node ids.
     fn topological_sort(plan: &WorkflowPlanJson) -> Vec<String> {
         let node_ids: Vec<&str> = plan.nodes.iter().map(|n| n.id.as_str()).collect();
         let node_set: HashSet<&str> = node_ids.iter().copied().collect();
@@ -482,7 +605,7 @@ impl WorkflowCompiler {
             }
         }
 
-        // 用排序后的队列保证确定性
+        // Use a sorted queue for deterministic output.
         let mut queue: Vec<&str> = in_degree
             .iter()
             .filter(|entry| *entry.1 == 0)
@@ -515,6 +638,21 @@ impl WorkflowCompiler {
 
         result
     }
+}
+
+fn normalize_workspace_key(path: &str) -> Option<String> {
+    let mut normalized = path.trim().replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        normalized = normalized.to_ascii_lowercase();
+    }
+    Some(normalized)
 }
 
 #[cfg(test)]
@@ -608,6 +746,63 @@ mod tests {
         assert!(graph.ready_step_keys.contains(&"task_1".to_string()));
         assert!(graph.ready_step_keys.contains(&"task_2".to_string()));
         assert!(!graph.ready_step_keys.contains(&"result".to_string()));
+    }
+
+    #[test]
+    fn detects_parallel_task_members_sharing_workspace_before_run() {
+        let graph = WorkflowCompiler::compile_from_json(sample_plan_json(), &agents()).unwrap();
+        let workspaces = HashMap::from([
+            ("agent-1".to_string(), "/workspace/project".to_string()),
+            ("agent-2".to_string(), "/workspace/project/".to_string()),
+        ]);
+
+        let conflicts = WorkflowCompiler::find_parallel_workspace_conflicts(&graph, &workspaces);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].wave_index, 0);
+        assert_eq!(conflicts[0].workspace_path, "/workspace/project");
+        assert_eq!(
+            conflicts[0].members,
+            vec![
+                ParallelWorkspaceMember {
+                    agent_id: "agent-1".to_string(),
+                    step_keys: vec!["task_1".to_string()],
+                },
+                ParallelWorkspaceMember {
+                    agent_id: "agent-2".to_string(),
+                    step_keys: vec!["task_2".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_same_workspace_members_when_tasks_are_serial() {
+        let plan = serde_json::json!({
+            "version": 1,
+            "title": "Serial task test",
+            "goal": "Serial task members share workspace but cannot run together",
+            "agents": { "lead": "lead-agent", "available": ["agent-1", "agent-2"] },
+            "nodes": [
+                { "id": "a", "type": "workflowStep", "position": { "x": 0, "y": 0 }, "data": { "stepType": "task", "agentId": "agent-1", "title": "A", "instructions": "A" } },
+                { "id": "b", "type": "workflowStep", "position": { "x": 200, "y": 0 }, "data": { "stepType": "task", "agentId": "agent-2", "title": "B", "instructions": "B" } },
+                { "id": "result", "type": "workflowStep", "position": { "x": 400, "y": 0 }, "data": { "stepType": "result", "title": "Result", "instructions": "Result" } }
+            ],
+            "edges": [
+                { "id": "a->b", "source": "a", "target": "b" },
+                { "id": "b->result", "source": "b", "target": "result" }
+            ]
+        })
+        .to_string();
+        let graph = WorkflowCompiler::compile_from_json(&plan, &agents()).unwrap();
+        let workspaces = HashMap::from([
+            ("agent-1".to_string(), "/workspace/project".to_string()),
+            ("agent-2".to_string(), "/workspace/project".to_string()),
+        ]);
+
+        let conflicts = WorkflowCompiler::find_parallel_workspace_conflicts(&graph, &workspaces);
+
+        assert!(conflicts.is_empty());
     }
 
     #[test]
@@ -714,7 +909,7 @@ mod tests {
         let result = WorkflowCompiler::compile_from_json(&invalid, &agents());
 
         assert!(
-            matches!(result, Err(CompileError::CompileError(message)) if message.contains("同时被"))
+            matches!(result, Err(CompileError::CompileError(message)) if message.contains("declared by both"))
         );
     }
 
@@ -779,10 +974,10 @@ mod tests {
         let Err(CompileError::CompileError(message)) = result else {
             panic!("expected aggregated reviewScope errors");
         };
-        assert!(message.contains("重复声明"));
+        assert!(message.contains("more than once"));
         assert!(message.contains("missing"));
-        assert!(message.contains("类型是 'review'"));
-        assert!(message.contains("不是该 review 的前置节点"));
+        assert!(message.contains("type 'review'"));
+        assert!(message.contains("not a predecessor"));
         assert!(message.contains("revise"));
     }
 

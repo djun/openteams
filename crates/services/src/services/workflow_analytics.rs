@@ -470,7 +470,7 @@ fn execution_events_for_to_status(
 ) -> (WorkflowAnalyticsEvent, Option<WorkflowAnalyticsEvent>) {
     let terminal_quality_event = match to_status {
         "completed" => Some(WorkflowAnalyticsEvent::WorkflowCompleted),
-        "failed" | "cancelled" => Some(WorkflowAnalyticsEvent::WorkflowFailed),
+        "failed" => Some(WorkflowAnalyticsEvent::WorkflowFailed),
         _ => None,
     };
     (
@@ -525,7 +525,7 @@ pub fn track_step_state_changed(
 ) {
     let event = match to_status {
         "running" => WorkflowAnalyticsEvent::StepStarted,
-        "completed" | "failed" | "cancelled" | "skipped" => WorkflowAnalyticsEvent::StepCompleted,
+        "completed" | "failed" | "skipped" => WorkflowAnalyticsEvent::StepCompleted,
         _ => return, // Only track meaningful transitions
     };
 
@@ -1748,17 +1748,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_cancelled_keeps_funnel_event_and_adds_quality_failed_event() {
-        let (funnel, terminal) = execution_events_for_to_status("cancelled");
-        assert_eq!(funnel, WorkflowAnalyticsEvent::ExecutionStateChanged);
-        assert_eq!(
-            terminal,
-            Some(WorkflowAnalyticsEvent::WorkflowFailed),
-            "cancelled should emit both execution_state_changed and quality.workflow_failed"
-        );
-    }
-
-    #[test]
     fn terminal_quality_events_remain_defined_for_completed_and_failed() {
         assert_eq!(
             WorkflowAnalyticsEvent::WorkflowCompleted.event_name(),
@@ -1779,9 +1768,7 @@ mod tests {
     fn track_step_to_running_produces_step_started() {
         let event = match "running" {
             "running" => Some(WorkflowAnalyticsEvent::StepStarted),
-            "completed" | "failed" | "cancelled" | "skipped" => {
-                Some(WorkflowAnalyticsEvent::StepCompleted)
-            }
+            "completed" | "failed" | "skipped" => Some(WorkflowAnalyticsEvent::StepCompleted),
             _ => None,
         };
         assert_eq!(event, Some(WorkflowAnalyticsEvent::StepStarted));
@@ -1792,9 +1779,7 @@ mod tests {
     fn track_step_to_completed_produces_step_completed() {
         let event = match "completed" {
             "running" => Some(WorkflowAnalyticsEvent::StepStarted),
-            "completed" | "failed" | "cancelled" | "skipped" => {
-                Some(WorkflowAnalyticsEvent::StepCompleted)
-            }
+            "completed" | "failed" | "skipped" => Some(WorkflowAnalyticsEvent::StepCompleted),
             _ => None,
         };
         assert_eq!(event, Some(WorkflowAnalyticsEvent::StepCompleted));
@@ -1804,9 +1789,7 @@ mod tests {
     fn track_step_to_waiting_produces_no_event() {
         let event = match "waiting_input" {
             "running" => Some(WorkflowAnalyticsEvent::StepStarted),
-            "completed" | "failed" | "cancelled" | "skipped" => {
-                Some(WorkflowAnalyticsEvent::StepCompleted)
-            }
+            "completed" | "failed" | "skipped" => Some(WorkflowAnalyticsEvent::StepCompleted),
             _ => None,
         };
         assert!(event.is_none());

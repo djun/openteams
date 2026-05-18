@@ -51,7 +51,7 @@ fn is_step_waiting(status: &WorkflowStepStatus) -> bool {
 fn is_step_completed_like(status: &WorkflowStepStatus) -> bool {
     matches!(
         status,
-        WorkflowStepStatus::Completed | WorkflowStepStatus::Skipped | WorkflowStepStatus::Cancelled
+        WorkflowStepStatus::Completed | WorkflowStepStatus::Skipped
     )
 }
 
@@ -103,16 +103,16 @@ pub fn derive_execution_status(
         return E::Running;
     }
 
-    if step_statuses.iter().any(is_step_failed_like) {
-        return E::Failed;
-    }
-
     if step_statuses.iter().any(is_step_waiting)
         && step_statuses.iter().all(|status| {
             is_step_waiting(status) || is_step_completed_like(status) || is_step_ready_like(status)
         })
     {
         return E::Waiting;
+    }
+
+    if step_statuses.iter().any(is_step_failed_like) {
+        return E::Paused;
     }
 
     if step_statuses
@@ -192,26 +192,13 @@ pub fn validate_execution_transition(
     let allowed = match from {
         Pending => matches!(
             to,
-            Running | Failed | Cancelled | Paused | Recompiling | Completed | Waiting
+            Running | Failed | Paused | Recompiling | Completed | Waiting
         ),
-        Running => matches!(
-            to,
-            Failed | Cancelled | Paused | Recompiling | Completed | Waiting
-        ),
+        Running => matches!(to, Failed | Paused | Recompiling | Completed | Waiting),
         Failed => matches!(to, Running | Paused | Recompiling | Waiting),
-        Cancelled => false,
-        Paused => matches!(
-            to,
-            Running | Failed | Cancelled | Recompiling | Completed | Waiting
-        ),
-        Recompiling => matches!(
-            to,
-            Running | Failed | Cancelled | Paused | Completed | Waiting
-        ),
-        Waiting => matches!(
-            to,
-            Running | Failed | Cancelled | Paused | Recompiling | Completed
-        ),
+        Paused => matches!(to, Running | Failed | Recompiling | Completed | Waiting),
+        Recompiling => matches!(to, Running | Failed | Paused | Completed | Waiting),
+        Waiting => matches!(to, Running | Failed | Paused | Recompiling | Completed),
         Completed => false,
     };
 
@@ -237,7 +224,7 @@ pub fn validate_step_transition(
     use WorkflowStepStatus::*;
 
     let allowed = match from {
-        Pending => matches!(to, Ready | Blocked | Cancelled),
+        Pending => matches!(to, Ready | Blocked),
         Ready => matches!(to, Running),
         Running => matches!(
             to,
@@ -253,12 +240,12 @@ pub fn validate_step_transition(
             Ready | Revising | Completed | Failed | WaitingInput | InterruptRequested
         ),
         InterruptRequested => matches!(to, Interrupted | Failed),
-        Interrupted => matches!(to, Ready | Failed | Cancelled),
-        Blocked => matches!(to, Ready | Cancelled),
-        Revising => matches!(to, Ready | Running | Failed | Cancelled),
+        Interrupted => matches!(to, Ready | Failed),
+        Blocked => matches!(to, Ready),
+        Revising => matches!(to, Ready | Running | Failed),
         Failed => matches!(to, Ready),
         Completed => matches!(to, Ready),
-        Skipped | Cancelled => false,
+        Skipped => false,
     };
 
     if allowed {
@@ -311,13 +298,18 @@ pub fn validate_step_in_execution(
         E::Pending => matches!(step_status, S::Pending | S::Ready | S::Blocked),
         E::Running => true,
         E::Failed => !matches!(step_status, S::Running),
-        E::Cancelled => !matches!(step_status, S::Running),
         E::Paused => matches!(
             step_status,
-            S::Pending | S::Ready | S::Blocked | S::Completed
+            S::Pending
+                | S::Ready
+                | S::Blocked
+                | S::Completed
+                | S::Failed
+                | S::InterruptRequested
+                | S::Interrupted
         ),
         E::Recompiling => !matches!(step_status, S::Running),
-        E::Completed => matches!(step_status, S::Completed | S::Skipped | S::Cancelled),
+        E::Completed => matches!(step_status, S::Completed | S::Skipped),
         E::Waiting => matches!(
             step_status,
             S::WaitingInput
@@ -327,7 +319,6 @@ pub fn validate_step_in_execution(
                 | S::Ready
                 | S::Completed
                 | S::Skipped
-                | S::Cancelled
                 | S::InterruptRequested
                 | S::Interrupted
         ),
@@ -351,11 +342,10 @@ pub fn validate_agent_session_in_execution(
             session_state,
             A::Idle | A::Paused | A::Completed | A::Failed
         ),
-        E::Cancelled => matches!(
+        E::Paused => matches!(
             session_state,
-            A::Idle | A::Paused | A::Completed | A::Failed
+            A::Idle | A::Completed | A::Paused | A::Failed
         ),
-        E::Paused => matches!(session_state, A::Idle | A::Completed | A::Paused),
         E::Recompiling => matches!(
             session_state,
             A::Idle | A::Paused | A::Completed | A::Failed
@@ -372,7 +362,6 @@ fn execution_event_type(to: &WorkflowExecutionStatus) -> WorkflowEventType {
         Pending => WorkflowEventType::ExecutionCreated,
         Running => WorkflowEventType::ExecutionRunning,
         Failed => WorkflowEventType::ExecutionFailed,
-        Cancelled => WorkflowEventType::ExecutionFailed,
         Paused => WorkflowEventType::ExecutionPaused,
         Recompiling => WorkflowEventType::PlanRecompiled,
         Completed => WorkflowEventType::ExecutionCompleted,
@@ -769,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_execution_status_prioritizes_running_then_failed() {
+    fn derive_execution_status_prioritizes_running_then_pauses_on_failed_steps() {
         assert_eq!(
             derive_execution_status(
                 &WorkflowExecutionStatus::Paused,
@@ -787,7 +776,15 @@ mod tests {
                 &WorkflowExecutionStatus::Paused,
                 &[WorkflowStepStatus::Completed, WorkflowStepStatus::Failed],
             ),
-            WorkflowExecutionStatus::Failed
+            WorkflowExecutionStatus::Paused
+        );
+
+        assert_eq!(
+            derive_execution_status(
+                &WorkflowExecutionStatus::Running,
+                &[WorkflowStepStatus::Failed, WorkflowStepStatus::Failed],
+            ),
+            WorkflowExecutionStatus::Paused
         );
     }
 
