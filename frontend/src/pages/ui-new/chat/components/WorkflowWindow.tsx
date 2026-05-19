@@ -2201,13 +2201,12 @@ export function WorkflowWindow({
     [openStepDetails]
   );
 
-  const activeStepPendingReview =
-    activeNodeId
-      ? (pendingReviews.find(
-          (pendingReview) =>
-            getPendingReviewNodeId(pendingReview) === activeNodeId
-        ) ?? null)
-      : null;
+  const activeStepPendingReview = activeNodeId
+    ? (pendingReviews.find(
+        (pendingReview) =>
+          getPendingReviewNodeId(pendingReview) === activeNodeId
+      ) ?? null)
+    : null;
   const activeStepPendingInput =
     activeStep && projection.pending_input?.step_id === activeStep.id
       ? projection.pending_input
@@ -2498,9 +2497,7 @@ export function WorkflowWindow({
                           onClick={() =>
                             openPendingReviewInChat(notif.id, notif.nodeId)
                           }
-                          disabled={
-                            pendingActionId === notif.id
-                          }
+                          disabled={pendingActionId === notif.id}
                           className="flex-1 py-1.5 bg-[#5094fb] text-white rounded-md text-[10px] font-bold shadow-sm hover:bg-[#4080e0] transition-colors disabled:opacity-50"
                         >
                           {t('workflow.notifications.approve', {
