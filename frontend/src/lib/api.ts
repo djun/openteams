@@ -299,6 +299,7 @@ export interface WorkflowCardData {
   }>;
   plan: WorkflowCardPlanData;
   pending_review?: WorkflowPendingReviewData | null;
+  pending_reviews?: WorkflowPendingReviewData[];
   pending_input?: WorkflowPendingInputData | null;
   validation_errors?: string | null;
   is_terminal?: boolean;

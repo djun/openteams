@@ -225,6 +225,7 @@ function patchWorkflowProjectionExecutionStatus(
     error_message: isRunning ? null : projection.error_message,
     is_terminal: isRunning ? false : isTerminal ? true : projection.is_terminal,
     pending_review: shouldClearPending ? null : projection.pending_review,
+    pending_reviews: shouldClearPending ? [] : projection.pending_reviews,
     pending_input: shouldClearPending ? null : projection.pending_input,
   };
 }
@@ -2191,11 +2192,13 @@ export function ChatSessions() {
       reviewId: string;
       action: 'approve' | 'reject';
       feedback?: string;
+      expectedStepId?: string;
     }) =>
       chatApi.respondToWorkflowReview({
         review_id: variables.reviewId,
         action: variables.action,
         feedback: variables.feedback ?? null,
+        expected_step_id: variables.expectedStepId ?? null,
       }),
     onSuccess: (_data, variables) => {
       if (!activeSessionId) return;
@@ -2437,8 +2440,18 @@ export function ChatSessions() {
     [resolveActionMutation]
   );
   const handleRespondPendingWorkflowReview = useCallback(
-    (reviewId: string, action: 'approve' | 'reject', feedback?: string) => {
-      respondWorkflowReviewMutation.mutate({ reviewId, action, feedback });
+    (
+      reviewId: string,
+      action: 'approve' | 'reject',
+      feedback?: string,
+      expectedStepId?: string
+    ) => {
+      respondWorkflowReviewMutation.mutate({
+        reviewId,
+        action,
+        feedback,
+        expectedStepId,
+      });
     },
     [respondWorkflowReviewMutation]
   );

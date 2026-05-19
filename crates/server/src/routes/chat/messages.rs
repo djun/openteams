@@ -697,6 +697,7 @@ async fn build_plan_workflow_card_projection(
         current_round: 0,
         loops: Vec::new(),
         pending_review: None,
+        pending_reviews: Vec::new(),
         pending_input: None,
         iteration_history: Vec::new(),
         round_graphs: Vec::new(),

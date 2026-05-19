@@ -265,6 +265,8 @@ pub struct WorkflowCardProjection {
     pub current_round: i32,
     pub loops: Vec<WorkflowCardLoop>,
     pub pending_review: Option<WorkflowPendingReview>,
+    #[serde(default)]
+    pub pending_reviews: Vec<WorkflowPendingReview>,
     pub pending_input: Option<WorkflowPendingInput>,
     pub iteration_history: Vec<WorkflowIterationSummary>,
     pub round_graphs: Vec<WorkflowRoundGraph>,
@@ -1890,7 +1892,8 @@ pub fn build_workflow_card_projection(
     let loop_key_by_step_key = build_loop_key_by_step_key(&plan_json, steps, loops);
     apply_runtime_loop_keys(&mut plan_json, &loop_key_by_step_key);
 
-    let pending_review = build_pending_review(steps, loops, transcripts);
+    let pending_reviews = build_pending_reviews(steps, loops, transcripts);
+    let pending_review = pending_reviews.first().cloned();
     let pending_input = build_pending_input(steps, transcripts);
 
     let step_views = build_workflow_step_views(
@@ -1978,6 +1981,7 @@ pub fn build_workflow_card_projection(
         current_round: execution.current_round,
         loops: loop_views,
         pending_review,
+        pending_reviews,
         pending_input,
         iteration_history,
         round_graphs,
@@ -2056,7 +2060,8 @@ pub fn build_workflow_card_projection_lightweight(
     let loop_key_by_step_key = build_loop_key_by_step_key(&plan_json, steps, loops);
     apply_runtime_loop_keys(&mut plan_json, &loop_key_by_step_key);
 
-    let pending_review = build_pending_review(steps, loops, transcripts);
+    let pending_reviews = build_pending_reviews(steps, loops, transcripts);
+    let pending_review = pending_reviews.first().cloned();
     let pending_input = build_pending_input(steps, transcripts);
 
     let step_views = build_workflow_step_summary_views(
@@ -2145,6 +2150,7 @@ pub fn build_workflow_card_projection_lightweight(
         current_round: execution.current_round,
         loops: loop_views,
         pending_review,
+        pending_reviews,
         pending_input,
         iteration_history,
         round_graphs,
@@ -4028,20 +4034,31 @@ fn build_pending_input(
     })
 }
 
-fn build_pending_review(
+fn build_pending_reviews(
     steps: &[WorkflowStep],
     loops: &[WorkflowLoop],
     transcripts: &[WorkflowTranscript],
+) -> Vec<WorkflowPendingReview> {
+    transcripts
+        .iter()
+        .filter_map(|transcript| build_pending_review_for_transcript(steps, loops, transcript))
+        .collect()
+}
+
+fn build_pending_review_for_transcript(
+    steps: &[WorkflowStep],
+    loops: &[WorkflowLoop],
+    transcript: &WorkflowTranscript,
 ) -> Option<WorkflowPendingReview> {
-    let transcript = transcripts.iter().find(|transcript| {
-        matches!(
-            transcript.entry_type.as_str(),
-            "step_review" | "loop_review"
-        ) && !matches!(
-            transcript_meta_value(transcript).get("resolved"),
-            Some(serde_json::Value::Bool(true))
-        )
-    })?;
+    if !matches!(
+        transcript.entry_type.as_str(),
+        "step_review" | "loop_review"
+    ) || matches!(
+        transcript_meta_value(transcript).get("resolved"),
+        Some(serde_json::Value::Bool(true))
+    ) {
+        return None;
+    }
 
     let step = steps
         .iter()
@@ -5391,7 +5408,7 @@ mod tests {
             &[],
             &[],
             &[review],
-            &[transcript],
+            std::slice::from_ref(&transcript),
             &[],
             &session_agents,
             &agents,
@@ -5425,6 +5442,64 @@ mod tests {
                 .as_ref()
                 .map(|item| item.target_id.as_str()),
             Some(projection.steps[0].id.as_str())
+        );
+        assert_eq!(projection.pending_reviews.len(), 1);
+        assert_eq!(
+            projection.pending_reviews[0].review_id,
+            transcript.id.to_string()
+        );
+    }
+
+    #[test]
+    fn workflow_projection_includes_all_pending_step_reviews() {
+        let execution = sample_execution(WorkflowExecutionStatus::Waiting);
+        let plan_json = sample_plan_json();
+        let plan = sample_plan(execution.plan_id);
+        let revision = sample_revision(plan.id, plan_json);
+        let (session_agents, agents) = sample_agent_views();
+        let mut first_step = sample_step(WorkflowStepStatus::WaitingInput);
+        first_step.execution_id = execution.id;
+        first_step.title = "First step".to_string();
+        let mut second_step = sample_step(WorkflowStepStatus::WaitingInput);
+        second_step.execution_id = execution.id;
+        second_step.title = "Second step".to_string();
+        let first_transcript = sample_step_review_transcript(&first_step);
+        let second_transcript = sample_step_review_transcript(&second_step);
+
+        let projection = build_workflow_card_projection(
+            &execution,
+            &plan,
+            &revision,
+            std::slice::from_ref(&revision),
+            &[first_step.clone(), second_step.clone()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[first_transcript.clone(), second_transcript.clone()],
+            &[],
+            &session_agents,
+            &agents,
+            None,
+        )
+        .expect("build projection");
+
+        assert_eq!(projection.pending_reviews.len(), 2);
+        assert_eq!(
+            projection
+                .pending_review
+                .as_ref()
+                .map(|review| review.review_id.clone()),
+            Some(first_transcript.id.to_string())
+        );
+        assert_eq!(
+            projection
+                .pending_reviews
+                .iter()
+                .map(|review| review.target_id.clone())
+                .collect::<Vec<_>>(),
+            vec![first_step.id.to_string(), second_step.id.to_string()]
         );
     }
 

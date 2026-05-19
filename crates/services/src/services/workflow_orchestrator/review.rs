@@ -498,10 +498,17 @@ impl WorkflowOrchestrator {
                 Self::refresh_execution_projection(pool, chat_runner, refreshed_execution.id, None)
                     .await?;
 
+                let should_wake_scheduler = !Self::has_other_unresolved_step_or_loop_reviews(
+                    pool,
+                    execution.id,
+                    updated_transcript.id,
+                )
+                .await?;
+
                 Ok(ResolvedTranscriptAction {
                     transcript: updated_transcript,
                     execution: refreshed_execution,
-                    should_wake_scheduler: true,
+                    should_wake_scheduler,
                 })
             }
             "rejected" | "reject" => {
@@ -613,10 +620,17 @@ impl WorkflowOrchestrator {
                 Self::refresh_execution_projection(pool, chat_runner, resumed_execution.id, None)
                     .await?;
 
+                let should_wake_scheduler = !Self::has_other_unresolved_step_or_loop_reviews(
+                    pool,
+                    execution.id,
+                    updated_transcript.id,
+                )
+                .await?;
+
                 Ok(ResolvedTranscriptAction {
                     transcript: updated_transcript,
                     execution: resumed_execution,
-                    should_wake_scheduler: true,
+                    should_wake_scheduler,
                 })
             }
             action => Err(OrchestratorError::IllegalTransition(format!(
@@ -774,10 +788,17 @@ impl WorkflowOrchestrator {
                     Self::synchronize_runtime_state(pool, execution.id, false).await?;
                 Self::refresh_execution_projection(pool, chat_runner, refreshed_execution.id, None)
                     .await?;
+                let should_wake_scheduler = !Self::has_other_unresolved_step_or_loop_reviews(
+                    pool,
+                    execution.id,
+                    updated_transcript.id,
+                )
+                .await?;
+
                 Ok(ResolvedTranscriptAction {
                     transcript: updated_transcript,
                     execution: refreshed_execution,
-                    should_wake_scheduler: true,
+                    should_wake_scheduler,
                 })
             }
             "rejected" | "reject" => {
@@ -840,10 +861,17 @@ impl WorkflowOrchestrator {
                     Self::synchronize_runtime_state(pool, execution.id, false).await?;
                 Self::refresh_execution_projection(pool, chat_runner, resumed_execution.id, None)
                     .await?;
+                let should_wake_scheduler = !Self::has_other_unresolved_step_or_loop_reviews(
+                    pool,
+                    execution.id,
+                    updated_transcript.id,
+                )
+                .await?;
+
                 Ok(ResolvedTranscriptAction {
                     transcript: updated_transcript,
                     execution: resumed_execution,
-                    should_wake_scheduler: true,
+                    should_wake_scheduler,
                 })
             }
             action => Err(OrchestratorError::IllegalTransition(format!(
@@ -857,6 +885,22 @@ impl WorkflowOrchestrator {
         let ui_config = config::load_config_from_file(&config_path()).await;
         Self::localized_user_approved_loop_result_message_for_language(&ui_config.language)
             .to_string()
+    }
+
+    async fn has_other_unresolved_step_or_loop_reviews(
+        pool: &SqlitePool,
+        execution_id: Uuid,
+        resolved_transcript_id: Uuid,
+    ) -> Result<bool, OrchestratorError> {
+        let unresolved =
+            WorkflowTranscript::find_unresolved_reviews_by_execution(pool, execution_id).await?;
+        Ok(unresolved.iter().any(|transcript| {
+            transcript.id != resolved_transcript_id
+                && matches!(
+                    transcript.entry_type.as_str(),
+                    "step_review" | "loop_review"
+                )
+        }))
     }
 
     fn localized_user_approved_loop_result_message_for_language(

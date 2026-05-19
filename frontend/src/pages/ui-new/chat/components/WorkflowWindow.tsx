@@ -128,6 +128,14 @@ function canWorkflowStepAcceptChatInput(
   return step?.status === 'waiting_review' || step?.status === 'waiting_input';
 }
 
+function getPendingReviews(projection: WorkflowCardData) {
+  if (projection.pending_reviews && projection.pending_reviews.length > 0) {
+    return projection.pending_reviews;
+  }
+
+  return projection.pending_review ? [projection.pending_review] : [];
+}
+
 function getReviewSettingsErrorMessage(
   error: unknown,
   t: (key: string, opts?: Record<string, unknown>) => string
@@ -499,7 +507,8 @@ export type WorkflowWindowProps = {
   onRespondPendingReview?: (
     reviewId: string,
     action: 'approve' | 'reject',
-    feedback?: string
+    feedback?: string,
+    expectedStepId?: string
   ) => void;
   onSubmitIterationFeedback?: (payload: {
     executionId: string;
@@ -1299,7 +1308,8 @@ function ChatPanel({
   onRespondPendingReview?: (
     reviewId: string,
     action: 'approve' | 'reject',
-    feedback?: string
+    feedback?: string,
+    expectedStepId?: string
   ) => void;
   onClose: () => void;
   onSendInput?: (stepId: string, inputText: string) => void;
@@ -1513,7 +1523,8 @@ function ChatPanel({
                       onRespondPendingReview(
                         pendingReview.review_id,
                         action,
-                        feedback
+                        feedback,
+                        step.id
                       )
                   : undefined
               }
@@ -1703,8 +1714,12 @@ export function WorkflowWindow({
     projection.execution_status === 'completed';
   const hasWorkflowFailed =
     projection.state === 'failed' || projection.execution_status === 'failed';
+  const pendingReviews = useMemo(
+    () => getPendingReviews(projection),
+    [projection]
+  );
   const hasPendingReview =
-    Boolean(projection.pending_review) ||
+    pendingReviews.length > 0 ||
     projection.steps.some((step) => step.status === 'waiting_review');
   const isReviewSettingsLocked =
     hasWorkflowCompleted ||
@@ -2053,20 +2068,20 @@ export function WorkflowWindow({
       (projection.state === 'waiting' ||
         projection.execution_status === 'waiting'));
 
-  const pendingReviewNodeId = useMemo(() => {
-    const pendingReview = projection.pending_review;
-    if (!pendingReview) return undefined;
+  const getPendingReviewNodeId = useCallback(
+    (pendingReview: NonNullable<WorkflowCardData['pending_review']>) => {
+      const directStep = stepById.get(pendingReview.target_id);
+      if (directStep) return directStep.step_key;
 
-    const directStep = stepById.get(pendingReview.target_id);
-    if (directStep) return directStep.step_key;
+      const loop = workflowLoops.find(
+        (item) => item.id === pendingReview.target_id
+      );
+      if (!loop) return undefined;
 
-    const loop = workflowLoops.find(
-      (item) => item.id === pendingReview.target_id
-    );
-    if (!loop) return undefined;
-
-    return stepById.get(loop.review_step_id)?.step_key;
-  }, [projection.pending_review, stepById, workflowLoops]);
+      return stepById.get(loop.review_step_id)?.step_key;
+    },
+    [stepById, workflowLoops]
+  );
 
   // Notification items from pending reviews
   const notifications = useMemo(() => {
@@ -2078,29 +2093,31 @@ export function WorkflowWindow({
       nodeId?: string;
     }> = [];
 
-    if (
-      projection.pending_review &&
-      !(
-        openedReviewNotificationId === projection.pending_review.review_id &&
+    for (const pendingReview of pendingReviews) {
+      const nodeId = getPendingReviewNodeId(pendingReview);
+      if (
+        openedReviewNotificationId === pendingReview.review_id &&
         isChatVisible &&
-        activeNodeId === pendingReviewNodeId
-      )
-    ) {
+        activeNodeId === nodeId
+      ) {
+        continue;
+      }
+
       items.push({
-        id: projection.pending_review.review_id,
-        type: projection.pending_review.review_type,
-        title: projection.pending_review.target_title,
+        id: pendingReview.review_id,
+        type: pendingReview.review_type,
+        title: pendingReview.target_title,
         message:
-          (projection.pending_review.prompt_template.message
+          (pendingReview.prompt_template.message
             ? localizeWorkflowGeneratedText(
-                projection.pending_review.prompt_template.message,
+                pendingReview.prompt_template.message,
                 t
               )
             : null) ||
           t('workflow.notifications.reviewRequired', {
             defaultValue: 'Review required',
           }),
-        nodeId: pendingReviewNodeId,
+        nodeId,
       });
     }
 
@@ -2142,11 +2159,11 @@ export function WorkflowWindow({
     return items;
   }, [
     activeNodeId,
+    getPendingReviewNodeId,
     isChatVisible,
     openedReviewNotificationId,
-    pendingReviewNodeId,
+    pendingReviews,
     projection.pending_input,
-    projection.pending_review,
     t,
     workflowFinalReviewAction,
   ]);
@@ -2185,8 +2202,11 @@ export function WorkflowWindow({
   );
 
   const activeStepPendingReview =
-    activeNodeId && activeNodeId === pendingReviewNodeId
-      ? projection.pending_review
+    activeNodeId
+      ? (pendingReviews.find(
+          (pendingReview) =>
+            getPendingReviewNodeId(pendingReview) === activeNodeId
+        ) ?? null)
       : null;
   const activeStepPendingInput =
     activeStep && projection.pending_input?.step_id === activeStep.id
@@ -2471,7 +2491,7 @@ export function WorkflowWindow({
                           defaultValue: 'RESPOND',
                         })}
                       </button>
-                    ) : projection.pending_review && onRespondPendingReview ? (
+                    ) : onRespondPendingReview ? (
                       <>
                         <button
                           type="button"
@@ -2479,8 +2499,7 @@ export function WorkflowWindow({
                             openPendingReviewInChat(notif.id, notif.nodeId)
                           }
                           disabled={
-                            pendingActionId ===
-                            projection.pending_review.review_id
+                            pendingActionId === notif.id
                           }
                           className="flex-1 py-1.5 bg-[#5094fb] text-white rounded-md text-[10px] font-bold shadow-sm hover:bg-[#4080e0] transition-colors disabled:opacity-50"
                         >

@@ -16,6 +16,8 @@ pub struct UserReviewResponseRequest {
     pub review_id: String,
     pub action: String,
     pub feedback: Option<String>,
+    #[serde(default)]
+    pub expected_step_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -65,6 +67,16 @@ pub async fn respond_to_review(
     let transcript = WorkflowTranscript::find_by_id(&deployment.db().pool, transcript_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("Review transcript not found.".to_string()))?;
+    if let Some(expected_step_id) = payload.expected_step_id.as_deref() {
+        let expected_step_id = Uuid::parse_str(expected_step_id.trim()).map_err(|_| {
+            ApiError::BadRequest("expected_step_id must be a valid UUID.".to_string())
+        })?;
+        if transcript.step_id != Some(expected_step_id) {
+            return Err(ApiError::BadRequest(
+                "Review target does not match the selected workflow step.".to_string(),
+            ));
+        }
+    }
 
     let normalized_action = normalize_review_action(&transcript.entry_type, &payload.action)?;
     let feedback = payload
